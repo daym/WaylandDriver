@@ -1841,13 +1841,18 @@ namespace System.Windows.Forms {
 		{
 			hotspot = GetStandardCursorHotspot (id);
 			scale = Math.Max (1, scale);
-			Bitmap bitmap = new Bitmap (32 * scale, 32 * scale, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+			Size logicalSize = GetStandardCursorSize (id);
+			Bitmap bitmap = new Bitmap (logicalSize.Width * scale, logicalSize.Height * scale, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
 			bitmap.SetResolution (96.0f * scale, 96.0f * scale);
 			using (Graphics graphics = Graphics.FromImage (bitmap)) {
 				graphics.Clear (Color.Transparent);
 				graphics.SmoothingMode = SmoothingMode.AntiAlias;
 				graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-				graphics.ScaleTransform (scale, scale);
+				// Core Wayland does not prescribe a fallback cursor size.  For
+				// standard cursors Mono gives us only a StdCursor id, so this
+				// backend owns the intrinsic logical size for each fallback shape;
+				// custom cursors use the exact bitmap size passed to DefineCursor.
+				graphics.ScaleTransform (logicalSize.Width * scale / 32.0f, logicalSize.Height * scale / 32.0f);
 
 				switch (id) {
 				case StdCursor.Cross:
@@ -1912,12 +1917,41 @@ namespace System.Windows.Forms {
 			return bitmap;
 		}
 
+		static Size GetStandardCursorSize (StdCursor id)
+		{
+			switch (id) {
+			case StdCursor.IBeam:
+				return new Size (18, 24);
+			case StdCursor.Cross:
+				return new Size (25, 25);
+			case StdCursor.WaitCursor:
+			case StdCursor.No:
+				return new Size (26, 26);
+			case StdCursor.Hand:
+				return new Size (24, 28);
+			case StdCursor.SizeAll:
+			case StdCursor.SizeNESW:
+			case StdCursor.SizeNS:
+			case StdCursor.SizeNWSE:
+			case StdCursor.SizeWE:
+			case StdCursor.HSplit:
+			case StdCursor.VSplit:
+				return new Size (28, 28);
+			default:
+				return new Size (32, 32);
+			}
+		}
+
 		static Point GetStandardCursorHotspot (StdCursor id)
 		{
 			switch (id) {
 			case StdCursor.Cross:
+				return new Point (12, 12);
 			case StdCursor.IBeam:
+				return new Point (9, 12);
 			case StdCursor.No:
+			case StdCursor.WaitCursor:
+				return new Point (13, 13);
 			case StdCursor.NoMove2D:
 			case StdCursor.NoMoveHoriz:
 			case StdCursor.NoMoveVert:
@@ -1934,10 +1968,9 @@ namespace System.Windows.Forms {
 			case StdCursor.SizeNS:
 			case StdCursor.SizeNWSE:
 			case StdCursor.SizeWE:
-			case StdCursor.WaitCursor:
 			case StdCursor.HSplit:
 			case StdCursor.VSplit:
-				return new Point (16, 16);
+				return new Point (14, 14);
 			case StdCursor.Hand:
 				return new Point (8, 6);
 			case StdCursor.UpArrow:
