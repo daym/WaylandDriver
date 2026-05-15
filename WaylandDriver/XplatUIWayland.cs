@@ -327,9 +327,10 @@ namespace System.Windows.Forms {
 			cursorSurfaceCommitted = false;
 			renderedCursor = IntPtr.Zero;
 
-			if (connection != null)
-				connection.Dispose ();
+			WaylandConnection closingConnection = connection;
 			connection = null;
+			if (closingConnection != null)
+				closingConnection.Dispose ();
 		}
 
 		internal override void AudibleAlert (AlertType alert)

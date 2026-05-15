@@ -9,6 +9,7 @@ namespace WaylandDriver.Wayland {
 		readonly Socket socket;
 		readonly object writeLock = new object ();
 		uint nextObjectId = 2;
+		bool disposed;
 
 		WaylandConnection (Socket socket)
 		{
@@ -157,7 +158,13 @@ namespace WaylandDriver.Wayland {
 
 		public void Dispose ()
 		{
-			socket.Close ();
+			lock (writeLock) {
+				if (disposed)
+					return;
+
+				disposed = true;
+				socket.Close ();
+			}
 		}
 
 		static string ResolveDisplayPath ()
