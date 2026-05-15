@@ -3850,7 +3850,7 @@ namespace System.Windows.Forms {
 				return;
 
 			if (rc == Rectangle.Empty)
-				rc = window.Hwnd.ClientRect;
+				rc = GetClientLocalRectangle (window);
 			window.Hwnd.AddInvalidArea (rc);
 			window.Hwnd.expose_pending = true;
 			PostMessage (handle, Msg.WM_PAINT, IntPtr.Zero, IntPtr.Zero);
@@ -6678,6 +6678,16 @@ namespace System.Windows.Forms {
 		Size GetToplevelWindowSize (WaylandWindow window)
 		{
 			return new Size (Math.Max (1, window.Hwnd.Width), Math.Max (1, window.Hwnd.Height));
+		}
+
+		Rectangle GetClientLocalRectangle (WaylandWindow window)
+		{
+			Rectangle client = window.Hwnd.ClientRect;
+			// Hwnd.ClientRect includes the nonclient offset for styled
+			// top-level Forms.  WM_PAINT client clips are client-local, matching
+			// Control.ClientRectangle and the Graphics returned by
+			// PaintEventStart, so a whole-client invalidation starts at 0,0.
+			return new Rectangle (0, 0, Math.Max (1, client.Width), Math.Max (1, client.Height));
 		}
 
 		bool HasPopupStyle (WaylandWindow window)
