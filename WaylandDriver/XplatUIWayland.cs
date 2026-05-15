@@ -25,8 +25,8 @@ namespace System.Windows.Forms {
 			public void EnsureBackBuffer ()
 			{
 				Rectangle client = Hwnd.ClientRect;
-				int width = Math.Max (1, client.Width);
-				int height = Math.Max (1, client.Height);
+				int width = checked (Math.Max (1, client.Width) * Math.Max (1, BufferScale));
+				int height = checked (Math.Max (1, client.Height) * Math.Max (1, BufferScale));
 
 				if (BackBuffer != null && BackBuffer.Width == width && BackBuffer.Height == height)
 					return;
@@ -500,13 +500,16 @@ namespace System.Windows.Forms {
 
 			window.EnsureBackBuffer ();
 			Rectangle clip = window.Hwnd.Invalid;
-			if (clip == Rectangle.Empty)
-				clip = new Rectangle (Point.Empty, window.BackBuffer.Size);
+			if (clip == Rectangle.Empty) {
+				Rectangle clientRect = window.Hwnd.ClientRect;
+				clip = new Rectangle (0, 0, Math.Max (1, clientRect.Width), Math.Max (1, clientRect.Height));
+			}
 
 			window.Hwnd.invalid_list.Clear ();
 			window.Hwnd.expose_pending = false;
 
 			Graphics graphics = Graphics.FromImage (window.BackBuffer);
+			ApplyLogicalScale (graphics, window);
 			graphics.SetClip (clip);
 			return new PaintEventArgs (graphics, clip);
 		}
@@ -555,7 +558,9 @@ namespace System.Windows.Forms {
 				return Graphics.FromImage (fallbackBitmap);
 
 			window.EnsureBackBuffer ();
-			return Graphics.FromImage (window.BackBuffer);
+			Graphics graphics = Graphics.FromImage (window.BackBuffer);
+			ApplyLogicalScale (graphics, window);
+			return graphics;
 		}
 
 		internal override void SetWindowPos (IntPtr handle, int x, int y, int width, int height)
@@ -1435,6 +1440,12 @@ namespace System.Windows.Forms {
 				b.WriteInt32 (window.Hwnd.X);
 				b.WriteInt32 (window.Hwnd.Y);
 			});
+		}
+
+		static void ApplyLogicalScale (Graphics graphics, WaylandWindow window)
+		{
+			if (window.BufferScale != 1)
+				graphics.ScaleTransform (window.BufferScale, window.BufferScale);
 		}
 
 		void ApplySubsurfaceZOrder (WaylandWindow window, IntPtr afterHWnd, bool top, bool bottom)

@@ -20,14 +20,14 @@ namespace WaylandDriver.Wayland {
 		IntPtr data;
 		bool disposed;
 
-		WaylandShmBuffer (uint bufferId, int logicalWidth, int logicalHeight, int scale, IntPtr data, int stride, int size)
+		WaylandShmBuffer (uint bufferId, int logicalWidth, int logicalHeight, int bufferWidth, int bufferHeight, int scale, IntPtr data, int stride, int size)
 		{
 			BufferId = bufferId;
 			LogicalWidth = logicalWidth;
 			LogicalHeight = logicalHeight;
 			Scale = scale;
-			BufferWidth = logicalWidth * scale;
-			BufferHeight = logicalHeight * scale;
+			BufferWidth = bufferWidth;
+			BufferHeight = bufferHeight;
 			Stride = stride;
 			Size = size;
 			this.data = data;
@@ -38,10 +38,10 @@ namespace WaylandDriver.Wayland {
 			if (scale < 1)
 				scale = 1;
 
-			int logicalWidth = Math.Max (1, bitmap.Width);
-			int logicalHeight = Math.Max (1, bitmap.Height);
-			int bufferWidth = checked (logicalWidth * scale);
-			int bufferHeight = checked (logicalHeight * scale);
+			int bufferWidth = Math.Max (1, bitmap.Width);
+			int bufferHeight = Math.Max (1, bitmap.Height);
+			int logicalWidth = Math.Max (1, (bufferWidth + scale - 1) / scale);
+			int logicalHeight = Math.Max (1, (bufferHeight + scale - 1) / scale);
 			int stride = checked (bufferWidth * 4);
 			int size = checked (stride * bufferHeight);
 			int fd = CreateAnonymousShmFile (size);
@@ -71,7 +71,7 @@ namespace WaylandDriver.Wayland {
 				});
 				connection.SendRequest (poolId, WaylandProtocol.WlShmPool.Destroy, null);
 
-				WaylandShmBuffer buffer = new WaylandShmBuffer (bufferId, logicalWidth, logicalHeight, scale, mapped, stride, size);
+				WaylandShmBuffer buffer = new WaylandShmBuffer (bufferId, logicalWidth, logicalHeight, bufferWidth, bufferHeight, scale, mapped, stride, size);
 				buffer.CopyFromBitmap (bitmap);
 				mapped = IntPtr.Zero;
 				return buffer;
@@ -109,25 +109,10 @@ namespace WaylandDriver.Wayland {
 				byte* srcBase = (byte*) bits.Scan0;
 				byte* dstBase = (byte*) data;
 
-				if (Scale == 1) {
-					for (int y = 0; y < LogicalHeight; y++) {
-						byte* src = srcBase + y * bits.Stride;
-						byte* dst = dstBase + y * Stride;
-						Buffer.MemoryCopy (src, dst, Stride, LogicalWidth * 4);
-					}
-					return;
-				}
-
-				for (int y = 0; y < LogicalHeight; y++) {
+				for (int y = 0; y < BufferHeight; y++) {
 					byte* src = srcBase + y * bits.Stride;
-					for (int sy = 0; sy < Scale; sy++) {
-						uint* dst = (uint*) (dstBase + (y * Scale + sy) * Stride);
-						for (int x = 0; x < LogicalWidth; x++) {
-							uint pixel = ((uint*) src) [x];
-							for (int sx = 0; sx < Scale; sx++)
-								dst [x * Scale + sx] = pixel;
-						}
-					}
+					byte* dst = dstBase + y * Stride;
+					Buffer.MemoryCopy (src, dst, Stride, BufferWidth * 4);
 				}
 			} finally {
 				bitmap.UnlockBits (bits);
