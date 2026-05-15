@@ -5,8 +5,7 @@ Mono 6 does not ship a native Wayland `System.Windows.Forms` backend. On Unix it
 This directory is a C# Wayland driver scaffold using the same loadable-driver shape as [https://github.com/migueldeicaza/CocoaDriver](https://github.com/migueldeicaza/CocoaDriver):
 
 ```sh
-cd WaylandDriver
-guix shell -m ../manifest.scm -- xbuild WaylandDriver.sln
+xbuild WaylandDriver.sln
 ```
 
 ```sh
