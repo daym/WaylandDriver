@@ -256,5 +256,21 @@ namespace WaylandDriver.Wayland {
 			public const ushort PopupDone = 1;
 			public const ushort Repositioned = 2;
 		}
+
+		internal static class ZxdgDecorationManagerV1 {
+			public const ushort Destroy = 0;
+			public const ushort GetToplevelDecoration = 1;
+		}
+
+		internal static class ZxdgToplevelDecorationV1 {
+			public const ushort Destroy = 0;
+			public const ushort SetMode = 1;
+			public const ushort UnsetMode = 2;
+
+			public const ushort Configure = 0;
+
+			public const uint ModeClientSide = 1;
+			public const uint ModeServerSide = 2;
+		}
 	}
 }

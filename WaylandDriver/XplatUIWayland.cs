@@ -24,6 +24,8 @@ namespace System.Windows.Forms {
 			public uint SubsurfaceId;
 			public uint XdgSurfaceId;
 			public uint XdgToplevelId;
+			public uint XdgToplevelDecorationId;
+			public uint XdgToplevelDecorationMode;
 			public uint XdgPopupId;
 			public bool XdgConfigured;
 			public bool BufferAttached;
@@ -3120,6 +3122,7 @@ namespace System.Windows.Forms {
 		uint selectionOfferId;
 		uint cursorShapeManagerId;
 		uint cursorShapeDeviceId;
+		uint xdgDecorationManagerId;
 		uint lastInputSerial;
 		uint nextDispatchInputSerial;
 		uint currentDispatchInputSerial;
@@ -3267,6 +3270,7 @@ namespace System.Windows.Forms {
 			seatId = connection.Bind (registry, "wl_seat", 5);
 			dataDeviceManagerId = connection.Bind (registry, "wl_data_device_manager", 3);
 			cursorShapeManagerId = connection.Bind (registry, "wp_cursor_shape_manager_v1", 1);
+			xdgDecorationManagerId = connection.Bind (registry, "zxdg_decoration_manager_v1", 1);
 			BindOutputs ();
 
 			if (compositorId == 0)
@@ -3302,6 +3306,8 @@ namespace System.Windows.Forms {
 					closingConnection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.Destroy, null);
 				if (cursorShapeManagerId != 0)
 					closingConnection.SendRequest (cursorShapeManagerId, WaylandProtocol.WpCursorShapeManagerV1.Destroy, null);
+				if (xdgDecorationManagerId != 0)
+					closingConnection.SendRequest (xdgDecorationManagerId, WaylandProtocol.ZxdgDecorationManagerV1.Destroy, null);
 				if (cursorSurfaceId != 0)
 					closingConnection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Destroy, null);
 			}
@@ -3333,6 +3339,7 @@ namespace System.Windows.Forms {
 			cursorSurfaceId = 0;
 			cursorShapeDeviceId = 0;
 			cursorShapeManagerId = 0;
+			xdgDecorationManagerId = 0;
 			cursorSurfaceCommitted = false;
 			renderedCursor = IntPtr.Zero;
 
@@ -5057,6 +5064,7 @@ namespace System.Windows.Forms {
 			liveConnection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.GetToplevel, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.XdgToplevelId);
 			});
+			CreateToplevelDecoration (window);
 			ApplyToplevelParent (window);
 			ApplyToplevelSizeConstraints (window, Size.Empty, Size.Empty);
 			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetTitle, delegate (WaylandRequestBuilder b) {
@@ -5073,6 +5081,27 @@ namespace System.Windows.Forms {
 			waylandObjects [window.SurfaceId] = window;
 			waylandObjects [window.XdgSurfaceId] = window;
 			waylandObjects [window.XdgToplevelId] = window;
+		}
+
+		void CreateToplevelDecoration (WaylandWindow window)
+		{
+			if (xdgDecorationManagerId == 0 || window.XdgToplevelId == 0 || window.XdgToplevelDecorationId != 0)
+				return;
+
+			WaylandConnection liveConnection = RequireConnection ();
+			window.XdgToplevelDecorationId = liveConnection.AllocateId ();
+			waylandObjects [window.XdgToplevelDecorationId] = window;
+			liveConnection.SendRequest (xdgDecorationManagerId, WaylandProtocol.ZxdgDecorationManagerV1.GetToplevelDecoration, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (window.XdgToplevelDecorationId);
+				b.WriteObject (window.XdgToplevelId);
+			});
+			// Decoration mode is compositor policy, but WinForms already draws
+			// only the client surface here.  Request server-side decoration before
+			// the first role commit so compositors such as sway can add borders or
+			// title bars without changing Mono's client-area accounting.
+			liveConnection.SendRequest (window.XdgToplevelDecorationId, WaylandProtocol.ZxdgToplevelDecorationV1.SetMode, delegate (WaylandRequestBuilder b) {
+				b.WriteUInt32 (WaylandProtocol.ZxdgToplevelDecorationV1.ModeServerSide);
+			});
 		}
 
 		void ApplyToplevelParent (WaylandWindow window)
@@ -5940,6 +5969,8 @@ namespace System.Windows.Forms {
 			if (liveConnection != null) {
 				if (window.XdgPopupId != 0)
 					liveConnection.SendRequest (window.XdgPopupId, WaylandProtocol.XdgPopup.Destroy, null);
+				if (window.XdgToplevelDecorationId != 0)
+					liveConnection.SendRequest (window.XdgToplevelDecorationId, WaylandProtocol.ZxdgToplevelDecorationV1.Destroy, null);
 				if (window.XdgToplevelId != 0)
 					liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.Destroy, null);
 				if (window.XdgSurfaceId != 0)
@@ -5954,11 +5985,14 @@ namespace System.Windows.Forms {
 			waylandObjects.Remove (window.SubsurfaceId);
 			waylandObjects.Remove (window.XdgSurfaceId);
 			waylandObjects.Remove (window.XdgToplevelId);
+			waylandObjects.Remove (window.XdgToplevelDecorationId);
 			waylandObjects.Remove (window.XdgPopupId);
 			window.SurfaceId = 0;
 			window.SubsurfaceId = 0;
 			window.XdgSurfaceId = 0;
 			window.XdgToplevelId = 0;
+			window.XdgToplevelDecorationId = 0;
+			window.XdgToplevelDecorationMode = 0;
 			window.XdgPopupId = 0;
 			window.XdgConfigured = false;
 			window.BufferAttached = false;
@@ -6137,6 +6171,11 @@ namespace System.Windows.Forms {
 					PostMessage (window.Hwnd.Handle, Msg.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
 					return;
 				}
+			}
+
+			if (message.ObjectId == window.XdgToplevelDecorationId) {
+				HandleToplevelDecorationMessage (window, message);
+				return;
 			}
 
 			if (message.ObjectId == window.XdgPopupId) {
@@ -6659,6 +6698,15 @@ namespace System.Windows.Forms {
 			window.Dispose ();
 			PostMessage (window.Hwnd.Handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
 			Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
+		}
+
+		void HandleToplevelDecorationMessage (WaylandWindow window, WaylandMessage message)
+		{
+			if (message.Opcode != WaylandProtocol.ZxdgToplevelDecorationV1.Configure)
+				return;
+
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+			window.XdgToplevelDecorationMode = reader.ReadUInt32 ();
 		}
 
 		WaylandWindow GetParentWindow (WaylandWindow window)

@@ -171,6 +171,11 @@ namespace WaylandDriver.Wayland {
 				return;
 			}
 
+			if (iface == "zxdg_decoration_manager_v1" && opcode == WaylandProtocol.ZxdgDecorationManagerV1.GetToplevelDecoration && reader.TryReadUInt32 (out objectId)) {
+				RegisterObject (objectId, "zxdg_toplevel_decoration_v1");
+				return;
+			}
+
 			if (iface == "xdg_wm_base") {
 				if (opcode == WaylandProtocol.XdgWmBase.CreatePositioner && reader.TryReadUInt32 (out objectId))
 					RegisterObject (objectId, "xdg_positioner");
@@ -226,6 +231,8 @@ namespace WaylandDriver.Wayland {
 				iface == "wl_data_source" ||
 				iface == "wp_cursor_shape_manager_v1" ||
 				iface == "wp_cursor_shape_device_v1" ||
+				iface == "zxdg_decoration_manager_v1" ||
+				iface == "zxdg_toplevel_decoration_v1" ||
 				iface == "xdg_positioner" ||
 				iface == "xdg_surface" ||
 				iface == "xdg_toplevel" ||
@@ -270,6 +277,15 @@ namespace WaylandDriver.Wayland {
 
 			if (iface == "xdg_toplevel" && name == "set_parent" && reader.TryReadUInt32 (out a))
 				return ObjectName (a);
+
+			if (iface == "zxdg_decoration_manager_v1" && name == "get_toplevel_decoration" &&
+			    reader.TryReadUInt32 (out a) &&
+			    reader.TryReadUInt32 (out b))
+				return "id=zxdg_toplevel_decoration_v1@" + a.ToString () + ", toplevel=" + ObjectName (b);
+
+			if (iface == "zxdg_toplevel_decoration_v1" && (name == "set_mode" || name == "configure") &&
+			    reader.TryReadUInt32 (out a))
+				return "mode=" + DecorationModeName (a);
 
 			if (iface == "xdg_toplevel" && name == "configure" &&
 			    reader.TryReadInt32 (out ia) &&
@@ -484,6 +500,20 @@ namespace WaylandDriver.Wayland {
 				if (opcode == WaylandProtocol.WpCursorShapeDeviceV1.SetShape)
 					return "set_shape";
 				break;
+			case "zxdg_decoration_manager_v1":
+				if (opcode == WaylandProtocol.ZxdgDecorationManagerV1.Destroy)
+					return "destroy";
+				if (opcode == WaylandProtocol.ZxdgDecorationManagerV1.GetToplevelDecoration)
+					return "get_toplevel_decoration";
+				break;
+			case "zxdg_toplevel_decoration_v1":
+				if (opcode == WaylandProtocol.ZxdgToplevelDecorationV1.Destroy)
+					return "destroy";
+				if (opcode == WaylandProtocol.ZxdgToplevelDecorationV1.SetMode)
+					return "set_mode";
+				if (opcode == WaylandProtocol.ZxdgToplevelDecorationV1.UnsetMode)
+					return "unset_mode";
+				break;
 			case "xdg_wm_base":
 				if (opcode == WaylandProtocol.XdgWmBase.Destroy)
 					return "destroy";
@@ -670,6 +700,10 @@ namespace WaylandDriver.Wayland {
 				if (opcode == WaylandProtocol.XdgPopup.Repositioned)
 					return "repositioned";
 				break;
+			case "zxdg_toplevel_decoration_v1":
+				if (opcode == WaylandProtocol.ZxdgToplevelDecorationV1.Configure)
+					return "configure";
+				break;
 			}
 
 			return "opcode" + opcode.ToString ();
@@ -693,6 +727,15 @@ namespace WaylandDriver.Wayland {
 		static string Escape (string value)
 		{
 			return value.Replace ("\\", "\\\\").Replace ("\"", "\\\"");
+		}
+
+		static string DecorationModeName (uint mode)
+		{
+			if (mode == WaylandProtocol.ZxdgToplevelDecorationV1.ModeClientSide)
+				return "client_side";
+			if (mode == WaylandProtocol.ZxdgToplevelDecorationV1.ModeServerSide)
+				return "server_side";
+			return mode.ToString ();
 		}
 
 		static string FormatRawBytes (byte [] data)
