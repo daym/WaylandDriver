@@ -1,8 +1,8 @@
-# Managed Wayland driver for Mono WinForms
+# Managed Wayland driver for Mono 6 WinForms
 
 Mono 6 does not ship a native Wayland `System.Windows.Forms` backend. On Unix it selects the X11 driver unless a loadable driver is supplied through `MONO_MWF_DRIVER`.
 
-This directory is a C# Wayland driver scaffold using the same loadable-driver shape as `../CocoaDriver`:
+This directory is a C# Wayland driver scaffold using the same loadable-driver shape as [https://github.com/migueldeicaza/CocoaDriver](https://github.com/migueldeicaza/CocoaDriver):
 
 ```sh
 cd WaylandDriver
@@ -11,12 +11,6 @@ guix shell -m ../manifest.scm -- xbuild WaylandDriver.sln
 
 ```sh
 MONO_MWF_DRIVER=/path/to/WaylandDriver/WaylandDriver/bin/Debug/CocoaDriver.dll mono app.exe
-```
-
-There is also a small control-gallery sample at `../samples/ControlGallery`. From the repository root:
-
-```sh
-./run-control-gallery-wayland.sh
 ```
 
 Text/edit controls in stock Mono 6 still call `Graphics.FromHwnd` directly through
@@ -52,8 +46,9 @@ Implemented:
 
 Not implemented yet:
 
-- Input from `wl_seat`, keyboard maps, pointer grabs, cursors, clipboard/data-device, drag and drop, tray, real monitor geometry, and full window state negotiation.
+- pointer grabs, drag and drop, tray, real monitor geometry, and full window state negotiation.
 - Fractional scaling/viewporter support; current HiDPI support is Wayland's integer `wl_surface.set_buffer_scale` path.
 - Buffer reuse; current painting creates a fresh shm buffer per commit and destroys it after compositor release.
 
 There are no custom C libraries and no dependency on `libwayland-client`. The low-level Wayland fd path is handled with Mono.Posix `sendmsg`, `CMSG_*`, `mmap`, and POSIX file APIs.
+libxkcommon CAN be optionally provided--and will be used if provided.
