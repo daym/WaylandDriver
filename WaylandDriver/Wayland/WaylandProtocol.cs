@@ -85,7 +85,8 @@ namespace WaylandDriver.Wayland {
 		}
 
 		internal static class WlPointer {
-			public const ushort Release = 0;
+			public const ushort SetCursor = 0;
+			public const ushort Release = 1;
 
 			public const ushort Enter = 0;
 			public const ushort Leave = 1;

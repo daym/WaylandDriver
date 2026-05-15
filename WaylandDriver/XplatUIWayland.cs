@@ -68,6 +68,15 @@ namespace System.Windows.Forms {
 			public bool On;
 		}
 
+		sealed class WaylandCursor {
+			public IntPtr Handle;
+			public bool Standard;
+			public StdCursor StandardId;
+			public Bitmap Bitmap;
+			public int HotspotX;
+			public int HotspotY;
+		}
+
 		// Mono's Control.DoubleBuffer uses XplatUI offscreen drawables.  These
 		// must be scaled the same way as real surfaces or double-buffered labels,
 		// buttons, etc. paint into 1x bitmaps and get enlarged later.
@@ -116,6 +125,7 @@ namespace System.Windows.Forms {
 		readonly Dictionary<uint, WaylandWindow> waylandObjects = new Dictionary<uint, WaylandWindow> ();
 		readonly Dictionary<uint, WaylandShmBuffer> waylandBuffers = new Dictionary<uint, WaylandShmBuffer> ();
 		readonly Dictionary<uint, WaylandOutput> waylandOutputs = new Dictionary<uint, WaylandOutput> ();
+		readonly Dictionary<IntPtr, WaylandCursor> cursors = new Dictionary<IntPtr, WaylandCursor> ();
 		readonly List<IntPtr> zOrder = new List<IntPtr> ();
 		readonly List<Timer> timers = new List<Timer> ();
 		readonly Bitmap fallbackBitmap = new Bitmap (1, 1, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
@@ -133,17 +143,24 @@ namespace System.Windows.Forms {
 		uint pointerId;
 		uint keyboardId;
 		uint lastInputSerial;
+		uint pointerEnterSerial;
+		uint cursorSurfaceId;
 		int nextHandle = 0x4000;
+		int nextCursorHandle = 0x800000;
 		IntPtr activeWindow = IntPtr.Zero;
 		IntPtr focusWindow = IntPtr.Zero;
 		IntPtr grabWindow = IntPtr.Zero;
 		IntPtr overrideCursor = IntPtr.Zero;
+		IntPtr renderedCursor = IntPtr.Zero;
 		WaylandWindow pointerWindow;
 		WaylandWindow keyboardWindow;
 		Point pointerSurfacePosition;
 		Point mousePosition;
 		MouseButtons mouseButtons;
 		Keys modifierKeys;
+		bool cursorVisible = true;
+		bool cursorSurfaceCommitted;
+		int renderedCursorScale;
 		IntPtr lastClickWindow = IntPtr.Zero;
 		Msg lastClickMessage;
 		int lastClickX;
@@ -279,6 +296,12 @@ namespace System.Windows.Forms {
 				window.Dispose ();
 			foreach (WaylandShmBuffer buffer in waylandBuffers.Values)
 				buffer.Dispose ();
+			if (cursorSurfaceId != 0 && connection != null)
+				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Destroy, null);
+			foreach (WaylandCursor cursor in cursors.Values) {
+				if (cursor.Bitmap != null)
+					cursor.Bitmap.Dispose ();
+			}
 			fallbackBitmap.Dispose ();
 			if (caret.Timer != null)
 				caret.Timer.Dispose ();
@@ -288,8 +311,12 @@ namespace System.Windows.Forms {
 			waylandObjects.Clear ();
 			waylandBuffers.Clear ();
 			waylandOutputs.Clear ();
+			cursors.Clear ();
 			evdevKeysDown.Clear ();
 			keyText.Clear ();
+			cursorSurfaceId = 0;
+			cursorSurfaceCommitted = false;
+			renderedCursor = IntPtr.Zero;
 
 			if (connection != null)
 				connection.Dispose ();
@@ -965,48 +992,90 @@ namespace System.Windows.Forms {
 
 		internal override void SetCursor (IntPtr hwnd, IntPtr cursor)
 		{
-			if (overrideCursor != IntPtr.Zero)
-				cursor = overrideCursor;
-
 			WaylandWindow window;
-			if (windows.TryGetValue (hwnd, out window))
+			if (windows.TryGetValue (hwnd, out window)) {
 				window.Hwnd.cursor = cursor;
+				if (pointerWindow == window)
+					ApplyCursor (window);
+			}
 		}
 
 		internal override void ShowCursor (bool show)
 		{
+			cursorVisible = show;
+			if (pointerWindow != null)
+				ApplyCursor (pointerWindow);
 		}
 
 		internal override void OverrideCursor (IntPtr cursor)
 		{
 			overrideCursor = cursor;
+			if (pointerWindow != null)
+				ApplyCursor (pointerWindow);
 		}
 
 		internal override IntPtr DefineCursor (Bitmap bitmap, Bitmap mask, Color cursorPixel, Color maskPixel, int xHotSpot, int yHotSpot)
 		{
-			return (IntPtr) bitmap.GetHashCode ();
+			if (bitmap == null)
+				return IntPtr.Zero;
+
+			IntPtr handle = AllocateCursorHandle ();
+			cursors [handle] = new WaylandCursor {
+				Handle = handle,
+				Bitmap = CreateCustomCursorBitmap (bitmap, mask, cursorPixel, maskPixel),
+				HotspotX = Math.Max (0, xHotSpot),
+				HotspotY = Math.Max (0, yHotSpot),
+			};
+			return handle;
 		}
 
 		internal override IntPtr DefineStdCursor (StdCursor id)
 		{
-			return (IntPtr) ((int) id + 1);
+			IntPtr handle = StandardCursorHandle (id);
+			if (!cursors.ContainsKey (handle)) {
+				Point hotspot;
+				cursors [handle] = new WaylandCursor {
+					Handle = handle,
+					Standard = true,
+					StandardId = id,
+					Bitmap = CreateStandardCursorBitmap (id, 1, out hotspot),
+					HotspotX = hotspot.X,
+					HotspotY = hotspot.Y,
+				};
+			}
+			return handle;
 		}
 
 		internal override Bitmap DefineStdCursorBitmap (StdCursor id)
 		{
-			return new Bitmap (CursorSize.Width, CursorSize.Height);
+			Point hotspot;
+			return CreateStandardCursorBitmap (id, 1, out hotspot);
 		}
 
 		internal override void DestroyCursor (IntPtr cursor)
 		{
+			WaylandCursor definition;
+			if (!cursors.TryGetValue (cursor, out definition) || definition.Standard)
+				return;
+
+			cursors.Remove (cursor);
+			if (definition.Bitmap != null)
+				definition.Bitmap.Dispose ();
+			if (renderedCursor == cursor) {
+				renderedCursor = IntPtr.Zero;
+				cursorSurfaceCommitted = false;
+				if (pointerWindow != null)
+					ApplyCursor (pointerWindow);
+			}
 		}
 
 		internal override void GetCursorInfo (IntPtr cursor, out int width, out int height, out int hotspotX, out int hotspotY)
 		{
-			width = CursorSize.Width;
-			height = CursorSize.Height;
-			hotspotX = 0;
-			hotspotY = 0;
+			WaylandCursor definition = GetCursorDefinition (cursor);
+			width = definition.Bitmap.Width;
+			height = definition.Bitmap.Height;
+			hotspotX = definition.HotspotX;
+			hotspotY = definition.HotspotY;
 		}
 
 		internal override void GetCursorPos (IntPtr hwnd, out int x, out int y)
@@ -1627,6 +1696,405 @@ namespace System.Windows.Forms {
 			CommitWindowBuffer (window);
 		}
 
+		void ApplyCursor (WaylandWindow window)
+		{
+			if (connection == null || pointerId == 0 || pointerEnterSerial == 0)
+				return;
+
+			if (!cursorVisible) {
+				connection.SendRequest (pointerId, WaylandProtocol.WlPointer.SetCursor, delegate (WaylandRequestBuilder b) {
+					b.WriteUInt32 (pointerEnterSerial);
+					b.WriteObject (0);
+					b.WriteInt32 (0);
+					b.WriteInt32 (0);
+				});
+				return;
+			}
+
+			IntPtr handle = overrideCursor != IntPtr.Zero ? overrideCursor : window.Hwnd.cursor;
+			if (handle == IntPtr.Zero)
+				handle = DefineStdCursor (StdCursor.Default);
+
+			WaylandCursor cursor = GetCursorDefinition (handle);
+			int scale = Math.Max (1, GetTargetScale (window));
+			EnsureCursorSurface ();
+			RenderCursorSurface (cursor, scale);
+
+			// Wayland cursors are not window properties.  The compositor asks
+			// for a cursor surface per pointer-enter serial, so every enter and
+			// every managed SetCursor needs to update wl_pointer.set_cursor.
+			connection.SendRequest (pointerId, WaylandProtocol.WlPointer.SetCursor, delegate (WaylandRequestBuilder b) {
+				b.WriteUInt32 (pointerEnterSerial);
+				b.WriteObject (cursorSurfaceId);
+				b.WriteInt32 (cursor.HotspotX);
+				b.WriteInt32 (cursor.HotspotY);
+			});
+		}
+
+		void EnsureCursorSurface ()
+		{
+			if (cursorSurfaceId != 0)
+				return;
+
+			cursorSurfaceId = connection.AllocateId ();
+			connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (cursorSurfaceId);
+			});
+			cursorSurfaceCommitted = false;
+		}
+
+		void RenderCursorSurface (WaylandCursor cursor, int scale)
+		{
+			if (cursorSurfaceCommitted && renderedCursor == cursor.Handle && renderedCursorScale == scale)
+				return;
+
+			using (Bitmap bitmap = RenderCursorBitmap (cursor, scale)) {
+				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (connection, shmId, bitmap, scale);
+				waylandBuffers [buffer.BufferId] = buffer;
+
+				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+					b.WriteInt32 (scale);
+				});
+				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
+					b.WriteObject (buffer.BufferId);
+					b.WriteInt32 (0);
+					b.WriteInt32 (0);
+				});
+				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.DamageBuffer, delegate (WaylandRequestBuilder b) {
+					b.WriteInt32 (0);
+					b.WriteInt32 (0);
+					b.WriteInt32 (buffer.BufferWidth);
+					b.WriteInt32 (buffer.BufferHeight);
+				});
+				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Commit, null);
+			}
+
+			renderedCursor = cursor.Handle;
+			renderedCursorScale = scale;
+			cursorSurfaceCommitted = true;
+		}
+
+		Bitmap RenderCursorBitmap (WaylandCursor cursor, int scale)
+		{
+			if (cursor.Standard) {
+				Point unused;
+				return CreateStandardCursorBitmap (cursor.StandardId, scale, out unused);
+			}
+
+			Bitmap source = cursor.Bitmap;
+			int width = Math.Max (1, source.Width * scale);
+			int height = Math.Max (1, source.Height * scale);
+			Bitmap scaled = new Bitmap (width, height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+			scaled.SetResolution (96.0f * scale, 96.0f * scale);
+			using (Graphics graphics = Graphics.FromImage (scaled)) {
+				graphics.Clear (Color.Transparent);
+				graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+				graphics.PixelOffsetMode = PixelOffsetMode.Half;
+				graphics.DrawImage (source, new Rectangle (0, 0, width, height), new Rectangle (0, 0, source.Width, source.Height), GraphicsUnit.Pixel);
+			}
+			return scaled;
+		}
+
+		WaylandCursor GetCursorDefinition (IntPtr handle)
+		{
+			WaylandCursor cursor;
+			if (handle != IntPtr.Zero && cursors.TryGetValue (handle, out cursor))
+				return cursor;
+			return cursors [DefineStdCursor (StdCursor.Default)];
+		}
+
+		IntPtr AllocateCursorHandle ()
+		{
+			return (IntPtr) Interlocked.Increment (ref nextCursorHandle);
+		}
+
+		static IntPtr StandardCursorHandle (StdCursor id)
+		{
+			return (IntPtr) (0x100000 + (int) id);
+		}
+
+		static Bitmap CreateCustomCursorBitmap (Bitmap bitmap, Bitmap mask, Color cursorPixel, Color maskPixel)
+		{
+			if (mask == null)
+				return new Bitmap (bitmap);
+
+			Bitmap result = new Bitmap (bitmap.Width, bitmap.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+			for (int y = 0; y < result.Height; y++) {
+				for (int x = 0; x < result.Width; x++) {
+					Color source = bitmap.GetPixel (x, y);
+					Color maskPixelAtPoint = x < mask.Width && y < mask.Height ? mask.GetPixel (x, y) : Color.Empty;
+					bool andBit = source.ToArgb () == cursorPixel.ToArgb ();
+					bool xorBit = maskPixelAtPoint.ToArgb () == maskPixel.ToArgb ();
+
+					if (!andBit && !xorBit)
+						result.SetPixel (x, y, Color.Black);
+					else if (andBit && !xorBit)
+						result.SetPixel (x, y, Color.White);
+					else
+						result.SetPixel (x, y, Color.Transparent);
+				}
+			}
+			return result;
+		}
+
+		static Bitmap CreateStandardCursorBitmap (StdCursor id, int scale, out Point hotspot)
+		{
+			hotspot = GetStandardCursorHotspot (id);
+			scale = Math.Max (1, scale);
+			Bitmap bitmap = new Bitmap (32 * scale, 32 * scale, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+			bitmap.SetResolution (96.0f * scale, 96.0f * scale);
+			using (Graphics graphics = Graphics.FromImage (bitmap)) {
+				graphics.Clear (Color.Transparent);
+				graphics.SmoothingMode = SmoothingMode.AntiAlias;
+				graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+				graphics.ScaleTransform (scale, scale);
+
+				switch (id) {
+				case StdCursor.Cross:
+					DrawCrossCursor (graphics);
+					break;
+				case StdCursor.IBeam:
+					DrawIBeamCursor (graphics);
+					break;
+				case StdCursor.Hand:
+					DrawHandCursor (graphics);
+					break;
+				case StdCursor.No:
+					DrawNoCursor (graphics);
+					break;
+				case StdCursor.SizeAll:
+				case StdCursor.NoMove2D:
+					DrawSizeAllCursor (graphics);
+					break;
+				case StdCursor.SizeWE:
+				case StdCursor.HSplit:
+				case StdCursor.NoMoveHoriz:
+				case StdCursor.PanEast:
+				case StdCursor.PanWest:
+					DrawHorizontalResizeCursor (graphics);
+					break;
+				case StdCursor.SizeNS:
+				case StdCursor.VSplit:
+				case StdCursor.NoMoveVert:
+				case StdCursor.PanNorth:
+				case StdCursor.PanSouth:
+					DrawVerticalResizeCursor (graphics);
+					break;
+				case StdCursor.SizeNESW:
+				case StdCursor.PanNE:
+				case StdCursor.PanSW:
+					DrawDiagonalResizeCursor (graphics, true);
+					break;
+				case StdCursor.SizeNWSE:
+				case StdCursor.PanNW:
+				case StdCursor.PanSE:
+					DrawDiagonalResizeCursor (graphics, false);
+					break;
+				case StdCursor.WaitCursor:
+					DrawWaitCursor (graphics);
+					break;
+				case StdCursor.Help:
+					DrawArrowCursor (graphics);
+					DrawQuestionMark (graphics);
+					break;
+				case StdCursor.AppStarting:
+					DrawArrowCursor (graphics);
+					DrawSmallWaitCursor (graphics);
+					break;
+				case StdCursor.UpArrow:
+					DrawUpArrowCursor (graphics);
+					break;
+				default:
+					DrawArrowCursor (graphics);
+					break;
+				}
+			}
+			return bitmap;
+		}
+
+		static Point GetStandardCursorHotspot (StdCursor id)
+		{
+			switch (id) {
+			case StdCursor.Cross:
+			case StdCursor.IBeam:
+			case StdCursor.No:
+			case StdCursor.NoMove2D:
+			case StdCursor.NoMoveHoriz:
+			case StdCursor.NoMoveVert:
+			case StdCursor.PanEast:
+			case StdCursor.PanNE:
+			case StdCursor.PanNorth:
+			case StdCursor.PanNW:
+			case StdCursor.PanSE:
+			case StdCursor.PanSouth:
+			case StdCursor.PanSW:
+			case StdCursor.PanWest:
+			case StdCursor.SizeAll:
+			case StdCursor.SizeNESW:
+			case StdCursor.SizeNS:
+			case StdCursor.SizeNWSE:
+			case StdCursor.SizeWE:
+			case StdCursor.WaitCursor:
+			case StdCursor.HSplit:
+			case StdCursor.VSplit:
+				return new Point (16, 16);
+			case StdCursor.Hand:
+				return new Point (8, 6);
+			case StdCursor.UpArrow:
+				return new Point (16, 1);
+			default:
+				return new Point (2, 2);
+			}
+		}
+
+		static void DrawArrowCursor (Graphics graphics)
+		{
+			FillOutlinedPolygon (graphics, new [] {
+				new PointF (2, 2),
+				new PointF (2, 25),
+				new PointF (8, 19),
+				new PointF (12, 30),
+				new PointF (17, 28),
+				new PointF (13, 18),
+				new PointF (22, 18),
+			});
+		}
+
+		static void DrawIBeamCursor (Graphics graphics)
+		{
+			DrawOutlinedLine (graphics, 16, 6, 16, 26);
+			DrawOutlinedLine (graphics, 11, 6, 21, 6);
+			DrawOutlinedLine (graphics, 11, 26, 21, 26);
+		}
+
+		static void DrawCrossCursor (Graphics graphics)
+		{
+			DrawOutlinedLine (graphics, 16, 5, 16, 27);
+			DrawOutlinedLine (graphics, 5, 16, 27, 16);
+		}
+
+		static void DrawHandCursor (Graphics graphics)
+		{
+			DrawOutlinedLine (graphics, 8, 16, 8, 7);
+			DrawOutlinedLine (graphics, 12, 17, 12, 5);
+			DrawOutlinedLine (graphics, 16, 18, 16, 8);
+			DrawOutlinedLine (graphics, 20, 19, 20, 11);
+			DrawOutlinedLine (graphics, 8, 18, 15, 27);
+			DrawOutlinedLine (graphics, 15, 27, 23, 24);
+			DrawOutlinedLine (graphics, 23, 24, 22, 16);
+		}
+
+		static void DrawNoCursor (Graphics graphics)
+		{
+			using (Pen white = new Pen (Color.White, 5))
+			using (Pen red = new Pen (Color.FromArgb (220, 30, 30), 3))
+			using (Pen black = new Pen (Color.Black, 1)) {
+				graphics.DrawEllipse (white, 7, 7, 18, 18);
+				graphics.DrawEllipse (red, 8, 8, 16, 16);
+				graphics.DrawEllipse (black, 8, 8, 16, 16);
+				graphics.DrawLine (white, 10, 23, 23, 10);
+				graphics.DrawLine (red, 11, 22, 22, 11);
+				graphics.DrawLine (black, 11, 22, 22, 11);
+			}
+		}
+
+		static void DrawSizeAllCursor (Graphics graphics)
+		{
+			DrawOutlinedLine (graphics, 16, 5, 16, 27);
+			DrawOutlinedLine (graphics, 5, 16, 27, 16);
+			FillOutlinedPolygon (graphics, new [] { new PointF (16, 3), new PointF (12, 8), new PointF (20, 8) });
+			FillOutlinedPolygon (graphics, new [] { new PointF (16, 29), new PointF (12, 24), new PointF (20, 24) });
+			FillOutlinedPolygon (graphics, new [] { new PointF (3, 16), new PointF (8, 12), new PointF (8, 20) });
+			FillOutlinedPolygon (graphics, new [] { new PointF (29, 16), new PointF (24, 12), new PointF (24, 20) });
+		}
+
+		static void DrawHorizontalResizeCursor (Graphics graphics)
+		{
+			DrawOutlinedLine (graphics, 6, 16, 26, 16);
+			FillOutlinedPolygon (graphics, new [] { new PointF (4, 16), new PointF (10, 11), new PointF (10, 21) });
+			FillOutlinedPolygon (graphics, new [] { new PointF (28, 16), new PointF (22, 11), new PointF (22, 21) });
+		}
+
+		static void DrawVerticalResizeCursor (Graphics graphics)
+		{
+			DrawOutlinedLine (graphics, 16, 6, 16, 26);
+			FillOutlinedPolygon (graphics, new [] { new PointF (16, 4), new PointF (11, 10), new PointF (21, 10) });
+			FillOutlinedPolygon (graphics, new [] { new PointF (16, 28), new PointF (11, 22), new PointF (21, 22) });
+		}
+
+		static void DrawDiagonalResizeCursor (Graphics graphics, bool nesw)
+		{
+			if (nesw) {
+				DrawOutlinedLine (graphics, 9, 23, 23, 9);
+				FillOutlinedPolygon (graphics, new [] { new PointF (25, 7), new PointF (18, 8), new PointF (24, 14) });
+				FillOutlinedPolygon (graphics, new [] { new PointF (7, 25), new PointF (8, 18), new PointF (14, 24) });
+			} else {
+				DrawOutlinedLine (graphics, 9, 9, 23, 23);
+				FillOutlinedPolygon (graphics, new [] { new PointF (7, 7), new PointF (14, 8), new PointF (8, 14) });
+				FillOutlinedPolygon (graphics, new [] { new PointF (25, 25), new PointF (18, 24), new PointF (24, 18) });
+			}
+		}
+
+		static void DrawWaitCursor (Graphics graphics)
+		{
+			DrawOutlinedLine (graphics, 10, 6, 22, 6);
+			DrawOutlinedLine (graphics, 10, 26, 22, 26);
+			DrawOutlinedLine (graphics, 11, 7, 21, 25);
+			DrawOutlinedLine (graphics, 21, 7, 11, 25);
+		}
+
+		static void DrawSmallWaitCursor (Graphics graphics)
+		{
+			DrawOutlinedLine (graphics, 22, 21, 29, 21);
+			DrawOutlinedLine (graphics, 22, 30, 29, 30);
+			DrawOutlinedLine (graphics, 23, 22, 28, 29);
+			DrawOutlinedLine (graphics, 28, 22, 23, 29);
+		}
+
+		static void DrawQuestionMark (Graphics graphics)
+		{
+			using (Font font = new Font (FontFamily.GenericSansSerif, 14, FontStyle.Bold, GraphicsUnit.Pixel))
+			using (Brush white = new SolidBrush (Color.White))
+			using (Brush black = new SolidBrush (Color.Black)) {
+				graphics.DrawString ("?", font, white, 19, 16);
+				graphics.DrawString ("?", font, black, 18, 15);
+			}
+		}
+
+		static void DrawUpArrowCursor (Graphics graphics)
+		{
+			FillOutlinedPolygon (graphics, new [] {
+				new PointF (16, 2),
+				new PointF (6, 14),
+				new PointF (12, 14),
+				new PointF (12, 28),
+				new PointF (20, 28),
+				new PointF (20, 14),
+				new PointF (26, 14),
+			});
+		}
+
+		static void DrawOutlinedLine (Graphics graphics, float x1, float y1, float x2, float y2)
+		{
+			using (Pen white = new Pen (Color.White, 4))
+			using (Pen black = new Pen (Color.Black, 2)) {
+				white.StartCap = white.EndCap = LineCap.Round;
+				black.StartCap = black.EndCap = LineCap.Round;
+				graphics.DrawLine (white, x1, y1, x2, y2);
+				graphics.DrawLine (black, x1, y1, x2, y2);
+			}
+		}
+
+		static void FillOutlinedPolygon (Graphics graphics, PointF [] points)
+		{
+			using (Brush white = new SolidBrush (Color.White))
+			using (Pen black = new Pen (Color.Black, 1.5f)) {
+				black.LineJoin = LineJoin.Round;
+				graphics.FillPolygon (white, points);
+				graphics.DrawPolygon (black, points);
+			}
+		}
+
 		void DestroyNativeWindow (WaylandWindow window)
 		{
 			if (connection == null)
@@ -1818,6 +2286,7 @@ namespace System.Windows.Forms {
 				pointerId = 0;
 				pointerWindow = null;
 				mouseButtons = MouseButtons.None;
+				pointerEnterSerial = 0;
 			}
 
 			if ((capabilities & WaylandProtocol.WlSeat.CapabilityKeyboard) != 0) {
@@ -1851,8 +2320,10 @@ namespace System.Windows.Forms {
 				if (!waylandObjects.TryGetValue (surfaceId, out window))
 					return;
 
+				pointerEnterSerial = lastInputSerial;
 				pointerWindow = window;
 				UpdatePointerPosition (window, x, y);
+				ApplyCursor (window);
 				PostPointerMessage (Msg.WM_MOUSE_ENTER, window, x, y, 0, CurrentMessageTime ());
 				PostPointerMessage (Msg.WM_MOUSEMOVE, window, x, y, 0, CurrentMessageTime ());
 				return;
@@ -1868,8 +2339,10 @@ namespace System.Windows.Forms {
 
 				if (grabWindow == IntPtr.Zero)
 					PostPointerMessage (Msg.WM_MOUSELEAVE, window, pointerSurfacePosition.X, pointerSurfacePosition.Y, 0, CurrentMessageTime ());
-				if (pointerWindow == window)
+				if (pointerWindow == window) {
 					pointerWindow = null;
+					pointerEnterSerial = 0;
+				}
 				return;
 			}
 
@@ -2127,6 +2600,8 @@ namespace System.Windows.Forms {
 				});
 				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
 			}
+			if (pointerWindow == window)
+				ApplyCursor (window);
 
 			foreach (WaylandWindow child in windows.Values) {
 				if (child.Hwnd.Parent == window.Hwnd)
