@@ -235,6 +235,7 @@ namespace WaylandDriver.Wayland {
 
 		internal static class XdgToplevel {
 			public const ushort Destroy = 0;
+			public const ushort SetParent = 1;
 			public const ushort SetTitle = 2;
 			public const ushort SetAppId = 3;
 			public const ushort SetMaxSize = 7;

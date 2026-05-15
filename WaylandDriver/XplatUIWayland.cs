@@ -3381,6 +3381,16 @@ namespace System.Windows.Forms {
 			hwnd.Parent = parent;
 			hwnd.initial_style = cp.WindowStyle;
 			hwnd.initial_ex_style = cp.WindowExStyle;
+			Form form = cp.control as Form;
+			if (form != null && form.Owner != null && form.Owner.IsHandleCreated) {
+				// Form.CreateHandle calls base.CreateHandle first, and only
+				// after that applies Form.Owner with XplatUI.SetOwner.  On Unix,
+				// visible Forms can map inside this CreateWindow call, so an
+				// owned dialog would otherwise get its first xdg_toplevel commit
+				// as unowned.  Copy Form.Owner into Hwnd.owner now so set_parent
+				// is sent before the initial map.
+				hwnd.owner = Hwnd.ObjectFromHandle (form.Owner.Handle);
+			}
 			hwnd.ClientRect = hwnd.GetClientRectangle (width, height);
 			hwnd.visible = false;
 			hwnd.enabled = !StyleSet (cp.Style, WindowStyles.WS_DISABLED);
@@ -3483,15 +3493,7 @@ namespace System.Windows.Forms {
 			if (!windows.TryGetValue (handle, out window) || window.XdgToplevelId == 0)
 				return;
 
-			WaylandConnection liveConnection = RequireConnection ();
-			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinSize, delegate (WaylandRequestBuilder b) {
-				b.WriteInt32 (min.Width);
-				b.WriteInt32 (min.Height);
-			});
-			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMaxSize, delegate (WaylandRequestBuilder b) {
-				b.WriteInt32 (max.Width);
-				b.WriteInt32 (max.Height);
-			});
+			ApplyToplevelSizeConstraints (window, min, max);
 		}
 
 		internal override void SetWindowStyle (IntPtr handle, CreateParams cp)
@@ -4033,6 +4035,8 @@ namespace System.Windows.Forms {
 				// xdg_popup it should have been from the start.
 				EnsureNativeWindow (window);
 				InvalidateWindowTree (window);
+			} else if (!isPopup && window.XdgToplevelId != 0) {
+				ApplyToplevelParent (window);
 			}
 			return true;
 		}
@@ -5053,6 +5057,8 @@ namespace System.Windows.Forms {
 			liveConnection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.GetToplevel, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.XdgToplevelId);
 			});
+			ApplyToplevelParent (window);
+			ApplyToplevelSizeConstraints (window, Size.Empty, Size.Empty);
 			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetTitle, delegate (WaylandRequestBuilder b) {
 				b.WriteString (window.Text);
 			});
@@ -5067,6 +5073,55 @@ namespace System.Windows.Forms {
 			waylandObjects [window.SurfaceId] = window;
 			waylandObjects [window.XdgSurfaceId] = window;
 			waylandObjects [window.XdgToplevelId] = window;
+		}
+
+		void ApplyToplevelParent (WaylandWindow window)
+		{
+			if (window.XdgToplevelId == 0)
+				return;
+
+			WaylandConnection liveConnection = RequireConnection ();
+			WaylandWindow parent = GetToplevelParentWindow (window);
+			uint parentToplevelId = 0;
+
+			if (parent != null) {
+				EnsureNativeWindow (parent);
+				parentToplevelId = parent.XdgToplevelId;
+			}
+
+			// Modal and owned WinForms Forms are still independent xdg_toplevel
+			// windows, not xdg_popup menus.  set_parent is the Wayland
+			// transient relationship that lets the compositor stack and minimize
+			// dialogs with their owner.
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetParent, delegate (WaylandRequestBuilder b) {
+				b.WriteObject (parentToplevelId);
+			});
+		}
+
+		void ApplyToplevelSizeConstraints (WaylandWindow window, Size min, Size max)
+		{
+			if (window.XdgToplevelId == 0)
+				return;
+
+			if (IsFixedSizeToplevel (window)) {
+				// X11 installs fixed-size WM hints during CreateWindow for
+				// non-resizable Forms.  Wayland needs the same constraint before
+				// the first xdg_toplevel commit, because Mono can map visible Unix
+				// Forms before Form.CreateHandle later calls UpdateMinMax.
+				Size fixedSize = GetToplevelWindowSize (window);
+				min = fixedSize;
+				max = fixedSize;
+			}
+
+			WaylandConnection liveConnection = RequireConnection ();
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinSize, delegate (WaylandRequestBuilder b) {
+				b.WriteInt32 (min.Width);
+				b.WriteInt32 (min.Height);
+			});
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMaxSize, delegate (WaylandRequestBuilder b) {
+				b.WriteInt32 (max.Width);
+				b.WriteInt32 (max.Height);
+			});
 		}
 
 		void CreatePopupNativeWindow (WaylandWindow window)
@@ -6608,6 +6663,23 @@ namespace System.Windows.Forms {
 			return window.Hwnd.Parent != null || StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_CHILD);
 		}
 
+		bool IsFixedSizeToplevel (WaylandWindow window)
+		{
+			if (IsSubsurfaceWindow (window) || IsPopupWindow (window))
+				return false;
+
+			Form form = Control.FromHandle (window.Hwnd.Handle) as Form;
+			if (form != null && form.FormBorderStyle == FormBorderStyle.None)
+				return false;
+
+			return !StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_THICKFRAME);
+		}
+
+		Size GetToplevelWindowSize (WaylandWindow window)
+		{
+			return new Size (Math.Max (1, window.Hwnd.Width), Math.Max (1, window.Hwnd.Height));
+		}
+
 		bool HasPopupStyle (WaylandWindow window)
 		{
 			return StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_POPUP);
@@ -6631,6 +6703,22 @@ namespace System.Windows.Forms {
 		{
 			WaylandWindow owner = GetPopupOwnerWindow (window);
 			return owner != null ? GetRootWindow (owner) : null;
+		}
+
+		WaylandWindow GetToplevelParentWindow (WaylandWindow window)
+		{
+			if (window.Hwnd.owner == null)
+				return null;
+
+			WaylandWindow owner;
+			if (!windows.TryGetValue (window.Hwnd.owner.Handle, out owner))
+				return null;
+
+			WaylandWindow root = GetRootWindow (owner);
+			if (root == null || root == window || IsPopupWindow (root))
+				return null;
+
+			return root;
 		}
 
 		WaylandWindow GetPopupOwnerWindow (WaylandWindow window)
