@@ -1,0 +1,20 @@
+ToolStripControlHost.Dispose(false) runs from Component.Finalize().  It must
+not dispose the hosted Control from that finalizer path: disposing WinForms
+controls can remove them from parent collections and trigger managed layout,
+including TextRenderer.MeasureText, on the finalizer thread while controls and
+fonts are already in teardown.  Only the explicit Dispose(true) path should
+dispose the hosted managed control.
+
+diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/ToolStripControlHost.cs b/mcs/class/System.Windows.Forms/System.Windows.Forms/ToolStripControlHost.cs
+index 9e64e4f..f3358a1 100644
+--- a/mcs/class/System.Windows.Forms/System.Windows.Forms/ToolStripControlHost.cs
++++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/ToolStripControlHost.cs
+@@ -292,7 +292,7 @@ namespace System.Windows.Forms
+ 		{
+ 			base.Dispose (disposing);
+ 
+-			if (control.Created && !control.IsDisposed)
++			if (disposing && control.Created && !control.IsDisposed)
+ 				control.Dispose ();
+ 		}
+ 		

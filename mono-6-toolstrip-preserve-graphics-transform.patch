@@ -1,0 +1,85 @@
+ToolStrip paints its items by translating the PaintEventArgs.Graphics to each
+item's local origin and then calling ResetTransform().  That assumes the
+incoming Graphics has an identity transform.  Backends that paint in logical
+coordinates over a scaled backing store, such as a HiDPI Wayland backend, pass
+in a Graphics with a pre-existing scale transform.  ResetTransform() discards
+that backend transform, so ToolStrip/MenuStrip item text is painted at the
+wrong scale while item layout and hit testing still use logical coordinates.
+
+Save and restore the Graphics state around ToolStrip's local translations
+instead.  With the usual identity transform this is equivalent to the old code;
+with a transformed Graphics it preserves the caller's coordinate system for
+each item and after painting the grip.
+
+diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/ToolStrip.cs b/mcs/class/System.Windows.Forms/System.Windows.Forms/ToolStrip.cs
+--- a/mcs/class/System.Windows.Forms/System.Windows.Forms/ToolStrip.cs
++++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/ToolStrip.cs
+@@ -30,6 +30,7 @@
+ using System.Runtime.InteropServices;
+ using System.ComponentModel;
+ using System.Drawing;
++using System.Drawing.Drawing2D;
+ using System.Windows.Forms.Layout;
+ using System.Collections.Generic;
+ using System.ComponentModel.Design.Serialization;
+@@ -996,17 +997,29 @@ namespace System.Windows.Forms
+ 				ToolStripItem tsi = displayed_items[i];
+ 				
+ 				if (tsi.Visible) {
+-					e.Graphics.TranslateTransform (tsi.Bounds.Left, tsi.Bounds.Top);
+-					tsi.FireEvent (e, ToolStripItemEventType.Paint);
+-					e.Graphics.ResetTransform ();
++					GraphicsState state = e.Graphics.Save ();
++					try {
++						// Preserve any transform supplied by the backend.  A
++						// ResetTransform here would throw away HiDPI scaling.
++						e.Graphics.TranslateTransform (tsi.Bounds.Left, tsi.Bounds.Top);
++						tsi.FireEvent (e, ToolStripItemEventType.Paint);
++					} finally {
++						e.Graphics.Restore (state);
++					}
+ 				}
+ 			}
+ 
+ 			// Paint the Overflow button if it's visible
+ 			if (this.overflow_button != null && this.overflow_button.Visible) {
+-				e.Graphics.TranslateTransform (this.overflow_button.Bounds.Left, this.overflow_button.Bounds.Top);
+-				this.overflow_button.FireEvent (e, ToolStripItemEventType.Paint);
+-				e.Graphics.ResetTransform ();
++				GraphicsState state = e.Graphics.Save ();
++				try {
++					// Preserve any transform supplied by the backend.  A
++					// ResetTransform here would throw away HiDPI scaling.
++					e.Graphics.TranslateTransform (this.overflow_button.Bounds.Left, this.overflow_button.Bounds.Top);
++					this.overflow_button.FireEvent (e, ToolStripItemEventType.Paint);
++				} finally {
++					e.Graphics.Restore (state);
++				}
+ 			}
+ 
+ 			Rectangle affected_bounds = new Rectangle (Point.Empty, this.Size);
+@@ -1041,9 +1054,16 @@ namespace System.Windows.Forms
+-			if (!(this is MenuStrip)) {
+-				if (this.orientation == Orientation.Horizontal)
+-					e.Graphics.TranslateTransform (2, 0);
+-				else
+-					e.Graphics.TranslateTransform (0, 2);
+-			}
++			GraphicsState state = e.Graphics.Save ();
++			try {
++				// The grip offset is local ToolStrip state.  Do not use
++				// ResetTransform after it, because the incoming Graphics may
++				// already carry a backend transform such as HiDPI scaling.
++				if (!(this is MenuStrip)) {
++					if (this.orientation == Orientation.Horizontal)
++						e.Graphics.TranslateTransform (2, 0);
++					else
++						e.Graphics.TranslateTransform (0, 2);
++				}
+ 
+-			this.Renderer.DrawGrip (new ToolStripGripRenderEventArgs (e.Graphics, this, this.GripRectangle, this.GripDisplayStyle, this.grip_style));
+-			e.Graphics.ResetTransform ();
++				this.Renderer.DrawGrip (new ToolStripGripRenderEventArgs (e.Graphics, this, this.GripRectangle, this.GripDisplayStyle, this.grip_style));
++			} finally {
++				e.Graphics.Restore (state);
++			}

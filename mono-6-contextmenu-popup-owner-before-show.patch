@@ -1,0 +1,31 @@
+Legacy ContextMenu popups are real WS_POPUP windows and are semantically owned
+by the form/root control that MenuTracker stores as GrabControl.  Unlike
+ToolStripDropDown, ComboBox drop-downs, and ToolTip windows, the old MenuTracker
+path never tells XplatUI about that owner before showing the internal
+PopUpWindow.
+
+Backends that need ownership at map time cannot recover from this later.  In
+particular, a Wayland backend must choose xdg_popup vs xdg_toplevel before the
+surface is first committed, and xdg_popup needs the parent surface up front.
+Set the native owner before showing both the top-level context menu popup and
+legacy submenu popups.
+
+diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/MenuAPI.cs b/mcs/class/System.Windows.Forms/System.Windows.Forms/MenuAPI.cs
+--- a/mcs/class/System.Windows.Forms/System.Windows.Forms/MenuAPI.cs
++++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/MenuAPI.cs
+@@ -285,6 +285,7 @@ namespace System.Windows.Forms
+ 			
+ 			menu.Wnd = new PopUpWindow (tracker.GrabControl, menu);
+ 			menu.Wnd.Location =  menu.Wnd.PointToClient (pnt);
++			XplatUI.SetOwner (menu.Wnd.Handle, tracker.GrabControl.Handle);
+ 			((PopUpWindow)menu.Wnd).ShowWindow ();
+ 
+ 			bool no_quit = true;
+@@ -422,6 +423,7 @@ namespace System.Windows.Forms
+ 			puw.Location = pnt;
+ 			item.Wnd = puw;
+ 
++			XplatUI.SetOwner (puw.Handle, GrabControl.Handle);
+ 			puw.ShowWindow ();
+ 		}
+ 

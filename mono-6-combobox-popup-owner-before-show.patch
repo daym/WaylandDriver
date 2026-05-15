@@ -1,0 +1,37 @@
+ComboBox drop-down listboxes are owned popups, so establish the owner before
+showing the listbox window.  Existing native backends tolerate this order:
+Win32 sets GWL_HWNDPARENT on an existing hidden HWND, X11 sets the transient-for
+hint on an existing hidden X window, and Carbon only records the managed owner.
+The order is also the one newer native backends need: Wayland xdg_popup roles
+are chosen when the surface is first mapped, and that role cannot be corrected
+after mapping an unowned toplevel.
+
+Creating the handle before Show means ComboListBox.CreateParams can be evaluated
+while is_visible is still false.  Clear WS_CHILD/WS_VISIBLE with masks instead
+of toggling them with XOR so the popup style is deterministic in both the old
+Show-before-Handle path and the new owner-before-Show path.
+
+diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/ComboBox.cs b/mcs/class/System.Windows.Forms/System.Windows.Forms/ComboBox.cs
+--- a/mcs/class/System.Windows.Forms/System.Windows.Forms/ComboBox.cs
++++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/ComboBox.cs
+@@ -2442,8 +2442,8 @@ namespace System.Windows.Forms {
+ 					if (owner == null || owner.DropDownStyle == ComboBoxStyle.Simple)
+ 						return cp;
+ 
+-					cp.Style ^= (int)WindowStyles.WS_CHILD;
+-					cp.Style ^= (int)WindowStyles.WS_VISIBLE;
++					cp.Style &= ~(int)WindowStyles.WS_CHILD;
++					cp.Style &= ~(int)WindowStyles.WS_VISIBLE;
+ 					cp.Style |= (int)WindowStyles.WS_POPUP;
+ 					cp.ExStyle |= (int) WindowExStyles.WS_EX_TOOLWINDOW | (int) WindowExStyles.WS_EX_TOPMOST;
+ 					return cp;
+@@ -2778,8 +2778,8 @@ namespace System.Windows.Forms {
+ 				Rectangle scrn_rect = Screen.FromControl (owner).Bounds;
+ 				if (this.Location.Y + this.Height >= scrn_rect.Bottom)
+ 					this.Location = new Point (this.Location.X, this.Location.Y - (this.Height + owner.TextArea.Height));
+-				Show ();
+ 				XplatUI.SetOwner (Handle, owner.Handle);
++				Show ();
+ 
+ 				Refresh ();
+ 				owner.OnDropDown (EventArgs.Empty);
