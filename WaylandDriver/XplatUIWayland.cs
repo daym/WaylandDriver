@@ -6619,6 +6619,12 @@ namespace System.Windows.Forms {
 			}
 
 			Control control = Control.FromHandle (window.Hwnd.Handle);
+			if (control is PopUpWindow) {
+				WaylandWindow owner = GetActiveMenuPopupOwnerWindow ();
+				if (owner != null)
+					return owner;
+			}
+
 			MonthCalendar calendar = control as MonthCalendar;
 			if (calendar != null && calendar.owner != null && calendar.owner.IsHandleCreated) {
 				// DateTimePicker creates its drop-down MonthCalendar as a
@@ -6629,6 +6635,32 @@ namespace System.Windows.Forms {
 				WaylandWindow owner;
 				if (windows.TryGetValue (calendar.owner.Handle, out owner))
 					return owner;
+			}
+
+			return null;
+		}
+
+		WaylandWindow GetActiveMenuPopupOwnerWindow ()
+		{
+			foreach (WaylandWindow candidate in windows.Values) {
+				Control control = Control.FromHandle (candidate.Hwnd.Handle);
+				if (control == null || control.ActiveTracker == null)
+					continue;
+
+				// Legacy ContextMenu uses MenuTracker plus an internal
+				// PopUpWindow instead of setting Hwnd.owner on that popup HWND.
+				// Wayland still needs a parent xdg_surface, so use the grab
+				// control that MenuTracker selected before constructing the
+				// PopUpWindow.
+				Control grabControl = control.ActiveTracker.GrabControl;
+				if (grabControl == null || !grabControl.IsHandleCreated)
+					return candidate;
+
+				WaylandWindow owner;
+				if (windows.TryGetValue (grabControl.Handle, out owner))
+					return owner;
+
+				return candidate;
 			}
 
 			return null;
