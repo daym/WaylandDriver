@@ -4025,14 +4025,18 @@ namespace System.Windows.Forms {
 			if (parent == null || parent.SurfaceId == 0)
 				return;
 
-			// wl_subsurface.place_above wants a Wayland surface object.  The
-			// parent surface is the bottom reference; otherwise translate Mono's
-			// sibling HWND ordering to sibling surface ids.
+			// Mono's SetZOrder(handle, after) has the Win32/X11 meaning used by
+			// the other backends: handle is placed below after.  Wayland names
+			// that operation directly as wl_subsurface.place_below.  Bottom is
+			// the lowest visible child, just above the parent surface; top and
+			// after==NULL are placed above the current topmost sibling.
 			uint targetSurface = parent.SurfaceId;
+			ushort opcode = WaylandProtocol.WlSubsurface.PlaceAbove;
 			WaylandWindow sibling;
-			if (!bottom && afterHWnd != IntPtr.Zero && windows.TryGetValue (afterHWnd, out sibling) && sibling.Hwnd.Parent == window.Hwnd.Parent && sibling.SurfaceId != 0)
+			if (!top && !bottom && afterHWnd != IntPtr.Zero && windows.TryGetValue (afterHWnd, out sibling) && sibling.Hwnd.Parent == window.Hwnd.Parent && sibling.SurfaceId != 0) {
 				targetSurface = sibling.SurfaceId;
-			else if (top) {
+				opcode = WaylandProtocol.WlSubsurface.PlaceBelow;
+			} else if (top || (!bottom && afterHWnd == IntPtr.Zero)) {
 				foreach (IntPtr handle in zOrder) {
 					if (handle == window.Hwnd.Handle)
 						continue;
@@ -4042,7 +4046,7 @@ namespace System.Windows.Forms {
 			}
 
 			WaylandConnection liveConnection = RequireConnection ();
-			liveConnection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.PlaceAbove, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (window.SubsurfaceId, opcode, delegate (WaylandRequestBuilder b) {
 				b.WriteObject (targetSurface);
 			});
 		}
