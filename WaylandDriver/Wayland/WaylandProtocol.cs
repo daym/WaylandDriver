@@ -238,6 +238,8 @@ namespace WaylandDriver.Wayland {
 			public const ushort SetParent = 1;
 			public const ushort SetTitle = 2;
 			public const ushort SetAppId = 3;
+			public const ushort Move = 5;
+			public const ushort Resize = 6;
 			public const ushort SetMaxSize = 7;
 			public const ushort SetMinSize = 8;
 			public const ushort SetMaximized = 9;
@@ -246,6 +248,16 @@ namespace WaylandDriver.Wayland {
 
 			public const ushort Configure = 0;
 			public const ushort Close = 1;
+
+			public const uint ResizeEdgeNone = 0;
+			public const uint ResizeEdgeTop = 1;
+			public const uint ResizeEdgeBottom = 2;
+			public const uint ResizeEdgeLeft = 4;
+			public const uint ResizeEdgeTopLeft = 5;
+			public const uint ResizeEdgeBottomLeft = 6;
+			public const uint ResizeEdgeRight = 8;
+			public const uint ResizeEdgeTopRight = 9;
+			public const uint ResizeEdgeBottomRight = 10;
 		}
 
 		internal static class XdgPopup {

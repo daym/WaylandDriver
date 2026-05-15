@@ -16,6 +16,7 @@ namespace System.Windows.Forms {
 	internal sealed class XplatUIWayland : XplatUIDriver {
 		sealed class WaylandWindow {
 			public Hwnd Hwnd;
+			public Control Control;
 			public string Text;
 			public FormWindowState State;
 			public Bitmap BackBuffer;
@@ -28,18 +29,21 @@ namespace System.Windows.Forms {
 			public uint XdgToplevelDecorationMode;
 			public uint XdgPopupId;
 			public bool XdgConfigured;
+			public bool DecorationConfigured;
+			public bool ClientDecorated;
 			public bool BufferAttached;
 			public readonly List<WaylandShmBuffer> Buffers = new List<WaylandShmBuffer> ();
 			public readonly HashSet<uint> EnteredOutputs = new HashSet<uint> ();
 
 			public void EnsureBackBuffer ()
 			{
-				Rectangle client = Hwnd.ClientRect;
+				int logicalWidth = ClientDecorated ? Hwnd.Width : Hwnd.ClientRect.Width;
+				int logicalHeight = ClientDecorated ? Hwnd.Height : Hwnd.ClientRect.Height;
 				// WinForms keeps using logical pixels.  The backing bitmap is in
 				// Wayland buffer pixels; ApplyLogicalScale maps logical drawing
 				// into this larger physical bitmap for HiDPI outputs.
-				int width = checked (Math.Max (1, client.Width) * Math.Max (1, BufferScale));
-				int height = checked (Math.Max (1, client.Height) * Math.Max (1, BufferScale));
+				int width = checked (Math.Max (1, logicalWidth) * Math.Max (1, BufferScale));
+				int height = checked (Math.Max (1, logicalHeight) * Math.Max (1, BufferScale));
 
 				if (BackBuffer != null && BackBuffer.Width == width && BackBuffer.Height == height)
 					return;
@@ -56,6 +60,121 @@ namespace System.Windows.Forms {
 				if (BackBuffer != null)
 					BackBuffer.Dispose ();
 				BackBuffer = null;
+			}
+		}
+
+		sealed class WaylandTopLevelWindowManager : InternalWindowManager {
+			readonly XplatUIWayland driver;
+
+			public WaylandTopLevelWindowManager (Form form, XplatUIWayland driver)
+				: base (form)
+			{
+				this.driver = driver;
+			}
+
+			protected override void Activate ()
+			{
+				if (driver != null && form.IsHandleCreated)
+					driver.Activate (form.Handle);
+				base.Activate ();
+			}
+
+			public override bool IsActive {
+				get { return driver != null && form.IsHandleCreated && driver.GetActive () == form.Handle; }
+			}
+
+			public override void SetWindowState (FormWindowState oldState, FormWindowState windowState)
+			{
+				if (driver == null || !form.IsHandleCreated) {
+					base.SetWindowState (oldState, windowState);
+					return;
+				}
+				driver.SetWindowState (form.Handle, windowState);
+				UpdateWindowDecorations (windowState);
+			}
+
+			public override FormWindowState GetWindowState ()
+			{
+				if (driver == null || !form.IsHandleCreated)
+					return base.GetWindowState ();
+				return driver.GetWindowState (form.Handle);
+			}
+
+			public Rectangle CalculateClientRectangle (int width, int height)
+			{
+				XplatUIWin32.RECT rect = new XplatUIWin32.RECT ();
+				rect.left = 0;
+				rect.top = 0;
+				rect.right = width;
+				rect.bottom = height;
+				rect = NCCalcSize (rect);
+				return new Rectangle (rect.left, rect.top,
+					Math.Max (1, rect.right - rect.left),
+					Math.Max (1, rect.bottom - rect.top));
+			}
+
+			protected override bool ShouldRemoveWindowManager (FormBorderStyle style)
+			{
+				return false;
+			}
+
+			protected override void NCPointToClient (ref int x, ref int y)
+			{
+				// The Wayland driver posts WM_NC* coordinates in the managed
+				// whole-window surface space.  InternalWindowManager's default
+				// path converts from screen/client coordinates, which would add
+				// the non-client offset a second time for this backend.
+			}
+
+			protected override bool HandleNCLButtonDown (ref Message m)
+			{
+				Activate ();
+
+				uint requestedEdge = driver.XdgResizeEdgeForHitTest ((HitTest) m.WParam.ToInt32 ());
+				if (requestedEdge != WaylandProtocol.XdgToplevel.ResizeEdgeNone) {
+					driver.BeginWaylandResize (form.Handle, requestedEdge);
+					return true;
+				}
+
+				int x = Control.LowOrder ((int) m.LParam.ToInt32 ());
+				int y = Control.HighOrder ((int) m.LParam.ToInt32 ());
+				NCPointToClient (ref x, ref y);
+				FormPos pos = FormPosForCoords (x, y);
+
+				if (form.ActiveMenu != null && XplatUI.IsEnabled (form.Handle)) {
+					MouseEventArgs mea = new MouseEventArgs (Form.FromParamToMouseButtons (m.WParam.ToInt32 ()), form.mouse_clicks, x, y - TitleBarHeight, 0);
+					form.ActiveMenu.OnMouseDown (form, mea);
+				}
+
+				if (pos == FormPos.TitleBar) {
+					TitleButtons.MouseDown (x, y);
+					if (!TitleButtons.AnyPushedTitleButtons && !IsMaximized)
+						driver.BeginWaylandMove (form.Handle);
+					XplatUI.InvalidateNC (form.Handle);
+					return true;
+				}
+
+				if (IsSizable) {
+					uint edge = driver.XdgResizeEdgeForFormPos (pos);
+					if (edge != WaylandProtocol.XdgToplevel.ResizeEdgeNone) {
+						driver.BeginWaylandResize (form.Handle, edge);
+						return true;
+					}
+				}
+
+				return false;
+			}
+
+			protected override void HandleTitleBarDoubleClick (int x, int y)
+			{
+				if (IconRectangleContains (x, y)) {
+					form.Close ();
+				} else if (form.WindowState == FormWindowState.Maximized) {
+					form.WindowState = FormWindowState.Normal;
+				} else {
+					form.WindowState = FormWindowState.Maximized;
+				}
+				base.HandleTitleBarDoubleClick (x, y);
 			}
 		}
 
@@ -293,6 +412,7 @@ namespace System.Windows.Forms {
 		const string MimeTextPlain = "text/plain";
 		const string MimeHtml = "text/html";
 		const string MimeRtf = "text/rtf";
+		const string ForceClientDecorationsEnvironmentVariable = "MONO_WAYLAND_FORCE_CSD";
 		static readonly IntPtr ClipboardHandle = new IntPtr (1);
 		static readonly IntPtr PrimarySelectionHandle = new IntPtr (2);
 
@@ -3138,8 +3258,10 @@ namespace System.Windows.Forms {
 		IntPtr renderedCursor = IntPtr.Zero;
 		WaylandWindow pointerWindow;
 		WaylandWindow keyboardWindow;
+		WaylandWindow nonClientHoverWindow;
 		Point pointerSurfacePosition;
 		Point mousePosition;
+		Point nonClientHoverPosition;
 		MouseButtons mouseButtons;
 		Keys modifierKeys;
 		uint keyboardModsDepressed;
@@ -3156,6 +3278,7 @@ namespace System.Windows.Forms {
 		uint lastClickTime;
 		bool themesEnabled;
 		bool quitPosted;
+		bool forceClientDecorations;
 
 		internal override event EventHandler Idle;
 
@@ -3261,6 +3384,7 @@ namespace System.Windows.Forms {
 
 		internal override IntPtr InitializeDriver ()
 		{
+			forceClientDecorations = EnvironmentFlag (ForceClientDecorationsEnvironmentVariable);
 			connection = WaylandConnection.ConnectFromEnvironment ();
 			registry = connection.GetRegistryRoundtrip ();
 			compositorId = connection.Bind (registry, "wl_compositor", 4);
@@ -3270,7 +3394,7 @@ namespace System.Windows.Forms {
 			seatId = connection.Bind (registry, "wl_seat", 5);
 			dataDeviceManagerId = connection.Bind (registry, "wl_data_device_manager", 3);
 			cursorShapeManagerId = connection.Bind (registry, "wp_cursor_shape_manager_v1", 1);
-			xdgDecorationManagerId = connection.Bind (registry, "zxdg_decoration_manager_v1", 1);
+			xdgDecorationManagerId = forceClientDecorations ? 0 : connection.Bind (registry, "zxdg_decoration_manager_v1", 1);
 			BindOutputs ();
 
 			if (compositorId == 0)
@@ -3340,11 +3464,23 @@ namespace System.Windows.Forms {
 			cursorShapeDeviceId = 0;
 			cursorShapeManagerId = 0;
 			xdgDecorationManagerId = 0;
+			forceClientDecorations = false;
 			cursorSurfaceCommitted = false;
 			renderedCursor = IntPtr.Zero;
 
 			if (closingConnection != null)
 				closingConnection.Dispose ();
+		}
+
+		static bool EnvironmentFlag (string name)
+		{
+			string value = Environment.GetEnvironmentVariable (name);
+			if (String.IsNullOrEmpty (value))
+				return false;
+
+			return value != "0" &&
+				!String.Equals (value, "false", StringComparison.OrdinalIgnoreCase) &&
+				!String.Equals (value, "no", StringComparison.OrdinalIgnoreCase);
 		}
 
 		internal override void AudibleAlert (AlertType alert)
@@ -3354,6 +3490,7 @@ namespace System.Windows.Forms {
 
 		internal override void BeginMoveResize (IntPtr handle)
 		{
+			BeginWaylandResize (handle, WaylandProtocol.XdgToplevel.ResizeEdgeBottomRight);
 		}
 
 		internal override void EnableThemes ()
@@ -3409,13 +3546,18 @@ namespace System.Windows.Forms {
 
 			WaylandWindow window = new WaylandWindow ();
 			window.Hwnd = hwnd;
+			window.Control = cp.control;
 			window.Text = cp.Caption ?? String.Empty;
 			window.State = FormWindowState.Normal;
 			windows [handle] = window;
 			zOrder.Add (handle);
+			if (xdgDecorationManagerId == 0 && CanUseClientDecorations (window))
+				window.ClientDecorated = true;
 
 			SendMessage (handle, Msg.WM_CREATE, (IntPtr) 1, IntPtr.Zero);
 			SendParentNotify (handle, Msg.WM_CREATE, Int32.MaxValue, Int32.MaxValue);
+			if (window.ClientDecorated)
+				SetClientDecoratedToplevel (window);
 
 			if (StyleSet (cp.Style, WindowStyles.WS_VISIBLE))
 				SetVisible (handle, true, true);
@@ -3466,6 +3608,8 @@ namespace System.Windows.Forms {
 				pointerWindow = null;
 			if (keyboardWindow == window)
 				keyboardWindow = null;
+			if (nonClientHoverWindow == window)
+				nonClientHoverWindow = null;
 		}
 
 		internal override FormWindowState GetWindowState (IntPtr handle)
@@ -3491,6 +3635,85 @@ namespace System.Windows.Forms {
 				liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinimized, null);
 			} else {
 				liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.UnsetMaximized, null);
+			}
+		}
+
+		void BeginWaylandMove (IntPtr handle)
+		{
+			WaylandWindow window;
+			if (!windows.TryGetValue (handle, out window) || window.XdgToplevelId == 0)
+				return;
+			if (seatId == 0 || currentDispatchInputSerial == 0)
+				return;
+
+			WaylandConnection liveConnection = RequireConnection ();
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.Move, delegate (WaylandRequestBuilder b) {
+				b.WriteObject (seatId);
+				b.WriteUInt32 (currentDispatchInputSerial);
+			});
+		}
+
+		void BeginWaylandResize (IntPtr handle, uint edge)
+		{
+			WaylandWindow window;
+			if (!windows.TryGetValue (handle, out window) || window.XdgToplevelId == 0)
+				return;
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeNone || seatId == 0 || currentDispatchInputSerial == 0)
+				return;
+
+			WaylandConnection liveConnection = RequireConnection ();
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.Resize, delegate (WaylandRequestBuilder b) {
+				b.WriteObject (seatId);
+				b.WriteUInt32 (currentDispatchInputSerial);
+				b.WriteUInt32 (edge);
+			});
+		}
+
+		uint XdgResizeEdgeForFormPos (InternalWindowManager.FormPos pos)
+		{
+			switch (pos) {
+			case InternalWindowManager.FormPos.Top:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeTop;
+			case InternalWindowManager.FormPos.Left:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeLeft;
+			case InternalWindowManager.FormPos.Right:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeRight;
+			case InternalWindowManager.FormPos.Bottom:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeBottom;
+			case InternalWindowManager.FormPos.TopLeft:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeTopLeft;
+			case InternalWindowManager.FormPos.TopRight:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeTopRight;
+			case InternalWindowManager.FormPos.BottomLeft:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeBottomLeft;
+			case InternalWindowManager.FormPos.BottomRight:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeBottomRight;
+			default:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeNone;
+			}
+		}
+
+		uint XdgResizeEdgeForHitTest (HitTest hit)
+		{
+			switch (hit) {
+			case HitTest.HTTOP:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeTop;
+			case HitTest.HTLEFT:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeLeft;
+			case HitTest.HTRIGHT:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeRight;
+			case HitTest.HTBOTTOM:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeBottom;
+			case HitTest.HTTOPLEFT:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeTopLeft;
+			case HitTest.HTTOPRIGHT:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeTopRight;
+			case HitTest.HTBOTTOMLEFT:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeBottomLeft;
+			case HitTest.HTBOTTOMRIGHT:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeBottomRight;
+			default:
+				return WaylandProtocol.XdgToplevel.ResizeEdgeNone;
 			}
 		}
 
@@ -3540,15 +3763,27 @@ namespace System.Windows.Forms {
 		internal override void SetBorderStyle (IntPtr handle, FormBorderStyle borderStyle)
 		{
 			WaylandWindow window;
-			if (windows.TryGetValue (handle, out window))
+			if (windows.TryGetValue (handle, out window)) {
 				window.Hwnd.border_style = borderStyle;
+				if (IsClientDecoratedToplevel (window)) {
+					RecalculateClientRect (window);
+					InvalidateNC (handle);
+					Invalidate (handle, Rectangle.Empty, false);
+				}
+			}
 		}
 
 		internal override void SetMenu (IntPtr handle, Menu menu)
 		{
 			WaylandWindow window;
-			if (windows.TryGetValue (handle, out window))
+			if (windows.TryGetValue (handle, out window)) {
 				window.Hwnd.menu = menu;
+				if (IsClientDecoratedToplevel (window)) {
+					RecalculateClientRect (window);
+					InvalidateNC (handle);
+					Invalidate (handle, Rectangle.Empty, false);
+				}
+			}
 		}
 
 		internal override bool GetText (IntPtr handle, out string text)
@@ -3670,8 +3905,10 @@ namespace System.Windows.Forms {
 			window.EnsureBackBuffer ();
 			Rectangle clip = window.Hwnd.Invalid;
 			if (clip == Rectangle.Empty) {
-				Rectangle clientRect = window.Hwnd.ClientRect;
-				clip = new Rectangle (0, 0, Math.Max (1, clientRect.Width), Math.Max (1, clientRect.Height));
+				if (!client && IsClientDecoratedToplevel (window))
+					clip = GetSurfaceLocalRectangle (window);
+				else
+					clip = GetClientLocalRectangle (window);
 			}
 
 			window.Hwnd.invalid_list.Clear ();
@@ -3681,6 +3918,8 @@ namespace System.Windows.Forms {
 			// The PaintEventArgs clip remains logical.  Only the Graphics target
 			// is scaled, so control layout and paint code see normal WinForms units.
 			ApplyLogicalScale (graphics, window);
+			if (client && IsClientDecoratedToplevel (window))
+				graphics.TranslateTransform (window.Hwnd.ClientRect.X, window.Hwnd.ClientRect.Y);
 			graphics.SetClip (clip);
 			return new PaintEventArgs (graphics, clip);
 		}
@@ -3712,6 +3951,8 @@ namespace System.Windows.Forms {
 			window.EnsureBackBuffer ();
 			Graphics graphics = Graphics.FromImage (window.BackBuffer);
 			ApplyLogicalScale (graphics, window);
+			if (IsClientDecoratedToplevel (window))
+				graphics.TranslateTransform (window.Hwnd.ClientRect.X, window.Hwnd.ClientRect.Y);
 			return graphics;
 		}
 
@@ -3775,7 +4016,7 @@ namespace System.Windows.Forms {
 			window.Hwnd.Y = y;
 			window.Hwnd.Width = Math.Max (1, width);
 			window.Hwnd.Height = Math.Max (1, height);
-			window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (window.Hwnd.Width, window.Hwnd.Height);
+			RecalculateClientRect (window);
 			if (popupRolePositionChanged) {
 				// xdg_popup geometry comes from the immutable xdg_positioner used
 				// at role creation.  When Mono moves/resizes a visible popup HWND,
@@ -3797,8 +4038,11 @@ namespace System.Windows.Forms {
 			// WinForms layout has already changed the logical client size.
 			if (window.Hwnd.visible && IsSubsurfaceWindow (window) && movedOrResized)
 				Invalidate (handle, Rectangle.Empty, false);
-			else if (window.Hwnd.visible && (window.Hwnd.Width != oldWidth || window.Hwnd.Height != oldHeight))
+			else if (window.Hwnd.visible && (window.Hwnd.Width != oldWidth || window.Hwnd.Height != oldHeight)) {
+				if (IsClientDecoratedToplevel (window))
+					InvalidateNC (handle);
 				Invalidate (handle, Rectangle.Empty, false);
+			}
 		}
 
 		internal override void GetWindowPos (IntPtr handle, bool isToplevel, out int x, out int y, out int width, out int height, out int clientWidth, out int clientHeight)
@@ -3865,6 +4109,9 @@ namespace System.Windows.Forms {
 
 		internal override void InvalidateNC (IntPtr handle)
 		{
+			WaylandWindow window;
+			if (windows.TryGetValue (handle, out window) && IsClientDecoratedToplevel (window))
+				window.Hwnd.AddInvalidArea (GetSurfaceLocalRectangle (window));
 			PostMessage (handle, Msg.WM_NCPAINT, IntPtr.Zero, IntPtr.Zero);
 		}
 
@@ -4965,7 +5212,15 @@ namespace System.Windows.Forms {
 
 		internal override void RequestNCRecalc (IntPtr hwnd)
 		{
-			PostMessage (hwnd, Msg.WM_NCCALCSIZE, IntPtr.Zero, IntPtr.Zero);
+			WaylandWindow window;
+			if (!windows.TryGetValue (hwnd, out window))
+				return;
+
+			RecalculateClientRect (window);
+			if (IsClientDecoratedToplevel (window)) {
+				InvalidateNC (hwnd);
+				Invalidate (hwnd, Rectangle.Empty, false);
+			}
 		}
 
 		internal override void ResetMouseHover (IntPtr hwnd)
@@ -5050,6 +5305,9 @@ namespace System.Windows.Forms {
 				return;
 			}
 
+			if (xdgDecorationManagerId == 0)
+				SetClientDecoratedToplevel (window);
+
 			window.SurfaceId = liveConnection.AllocateId ();
 			window.XdgSurfaceId = liveConnection.AllocateId ();
 			window.XdgToplevelId = liveConnection.AllocateId ();
@@ -5085,7 +5343,11 @@ namespace System.Windows.Forms {
 
 		void CreateToplevelDecoration (WaylandWindow window)
 		{
-			if (xdgDecorationManagerId == 0 || window.XdgToplevelId == 0 || window.XdgToplevelDecorationId != 0)
+			if (xdgDecorationManagerId == 0) {
+				SetClientDecoratedToplevel (window);
+				return;
+			}
+			if (window.XdgToplevelId == 0 || window.XdgToplevelDecorationId != 0)
 				return;
 
 			WaylandConnection liveConnection = RequireConnection ();
@@ -5171,7 +5433,7 @@ namespace System.Windows.Forms {
 			uint positionerId = liveConnection.AllocateId ();
 			window.BufferScale = parent.BufferScale;
 
-			Point parentScreen = GetWindowScreenLocation (parent);
+			Point parentScreen = GetSurfaceScreenLocation (parent);
 			Point popupScreen = GetWindowScreenLocation (window);
 			int relativeX = popupScreen.X - parentScreen.X;
 			int relativeY = popupScreen.Y - parentScreen.Y;
@@ -5329,9 +5591,10 @@ namespace System.Windows.Forms {
 		void DrawCaretOverlay (WaylandWindow window, Bitmap bitmap)
 		{
 			int scale = Math.Max (1, window.BufferScale);
+			Point clientOffset = GetClientSurfaceOffset (window);
 			Rectangle rect = new Rectangle (
-				caret.X * scale,
-				caret.Y * scale,
+				(caret.X + clientOffset.X) * scale,
+				(caret.Y + clientOffset.Y) * scale,
 				Math.Max (1, caret.Width * scale),
 				Math.Max (1, caret.Height * scale));
 			rect.Intersect (new Rectangle (0, 0, bitmap.Width, bitmap.Height));
@@ -5399,6 +5662,12 @@ namespace System.Windows.Forms {
 
 		void ApplyCursor (WaylandWindow window)
 		{
+			IntPtr handle = overrideCursor != IntPtr.Zero ? overrideCursor : window.Hwnd.cursor;
+			ApplyCursor (window, handle);
+		}
+
+		void ApplyCursor (WaylandWindow window, IntPtr handle)
+		{
 			if (pointerId == 0 || pointerEnterSerial == 0)
 				return;
 			WaylandConnection liveConnection = RequireConnection ();
@@ -5413,7 +5682,8 @@ namespace System.Windows.Forms {
 				return;
 			}
 
-			IntPtr handle = overrideCursor != IntPtr.Zero ? overrideCursor : window.Hwnd.cursor;
+			if (overrideCursor != IntPtr.Zero)
+				handle = overrideCursor;
 			if (handle == IntPtr.Zero)
 				handle = DefineStdCursor (StdCursor.Default);
 
@@ -5993,6 +6263,7 @@ namespace System.Windows.Forms {
 			window.XdgToplevelId = 0;
 			window.XdgToplevelDecorationId = 0;
 			window.XdgToplevelDecorationMode = 0;
+			window.DecorationConfigured = false;
 			window.XdgPopupId = 0;
 			window.XdgConfigured = false;
 			window.BufferAttached = false;
@@ -6032,6 +6303,8 @@ namespace System.Windows.Forms {
 
 		void InvalidateWindowTree (WaylandWindow window)
 		{
+			if (IsClientDecoratedToplevel (window))
+				InvalidateNC (window.Hwnd.Handle);
 			Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
 
 			List<WaylandWindow> children = new List<WaylandWindow> ();
@@ -6322,6 +6595,9 @@ namespace System.Windows.Forms {
 
 			WaylandWindow surfaceWindow = pointerWindow;
 			if (surfaceWindow == null)
+				return;
+
+			if (TryPostNonClientButtonMessage (surfaceWindow, down, up, dblclk, state, time))
 				return;
 
 			int targetX;
@@ -6631,6 +6907,8 @@ namespace System.Windows.Forms {
 				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
 					b.WriteInt32 (window.BufferScale);
 				});
+				if (IsClientDecoratedToplevel (window))
+					InvalidateNC (window.Hwnd.Handle);
 				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
 			}
 			if (pointerWindow == window)
@@ -6682,21 +6960,20 @@ namespace System.Windows.Forms {
 				return;
 
 			// xdg_toplevel.configure is the size of this wl_surface's window
-			// geometry.  This backend's top-level surface buffer contains only
-			// the WinForms client area; Mono's Hwnd.Width/Height remain whole
-			// Win32-style window sizes including its managed nonclient frame.
-			// Convert compositor surface sizes back to Mono window sizes before
-			// updating Hwnd, or each configure subtracts the frame again and the
-			// surface shrinks toward 1x1.
+			// geometry.  Server-decorated Wayland windows expose only Mono's
+			// client area as the surface; client-decorated windows expose the
+			// whole managed window so Mono's existing non-client frame can paint.
 			Size windowSize = TranslateToplevelSurfaceSizeToWindowSize (window, new Size (width, height));
 			if (windowSize.Width == window.Hwnd.Width && windowSize.Height == window.Hwnd.Height)
 				return;
 
 			window.Hwnd.Width = windowSize.Width;
 			window.Hwnd.Height = windowSize.Height;
-			window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (windowSize.Width, windowSize.Height);
+			RecalculateClientRect (window);
 			window.Dispose ();
 			PostMessage (window.Hwnd.Handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
+			if (IsClientDecoratedToplevel (window))
+				InvalidateNC (window.Hwnd.Handle);
 			Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
 		}
 
@@ -6707,6 +6984,9 @@ namespace System.Windows.Forms {
 
 			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
 			window.XdgToplevelDecorationMode = reader.ReadUInt32 ();
+			window.DecorationConfigured = true;
+			if (window.XdgToplevelDecorationMode == WaylandProtocol.ZxdgToplevelDecorationV1.ModeClientSide)
+				SetClientDecoratedToplevel (window);
 		}
 
 		WaylandWindow GetParentWindow (WaylandWindow window)
@@ -6723,6 +7003,105 @@ namespace System.Windows.Forms {
 			return window.Hwnd.Parent != null || StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_CHILD);
 		}
 
+		Control GetControl (WaylandWindow window)
+		{
+			return window.Control ?? Control.FromHandle (window.Hwnd.Handle);
+		}
+
+		Form GetForm (WaylandWindow window)
+		{
+			return GetControl (window) as Form;
+		}
+
+		bool CanUseClientDecorations (WaylandWindow window)
+		{
+			if (window == null || IsSubsurfaceWindow (window) || IsPopupWindow (window))
+				return false;
+
+			return GetForm (window) != null;
+		}
+
+		bool IsClientDecoratedToplevel (WaylandWindow window)
+		{
+			return window != null && window.ClientDecorated && CanUseClientDecorations (window);
+		}
+
+		void SetClientDecoratedToplevel (WaylandWindow window)
+		{
+			if (!CanUseClientDecorations (window))
+				return;
+
+			bool changed = !window.ClientDecorated;
+			window.ClientDecorated = true;
+			InstallClientDecorationWindowManager (window);
+			RecalculateClientRect (window);
+			window.Dispose ();
+
+			if (changed && window.SurfaceId != 0) {
+				// The wl_surface size convention is part of this backend's
+				// native role contract.  Switching from server to client
+				// decorations changes that convention, so recreate the role
+				// rather than committing a different geometry to the old one.
+				DestroyNativeWindow (window);
+				if (window.Hwnd.visible)
+					EnsureNativeWindow (window);
+			}
+
+			if (window.Hwnd.visible) {
+				InvalidateNC (window.Hwnd.Handle);
+				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
+			}
+		}
+
+		void InstallClientDecorationWindowManager (WaylandWindow window)
+		{
+			Form form = GetForm (window);
+			if (form == null)
+				return;
+
+			if (!(form.window_manager is WaylandTopLevelWindowManager))
+				form.window_manager = new WaylandTopLevelWindowManager (form, this);
+			ThemeEngine.Current.ManagedWindowSetButtonLocations (form.window_manager);
+		}
+
+		void RecalculateClientRect (WaylandWindow window)
+		{
+			Form form = GetForm (window);
+			if (form == null || form.window_manager == null) {
+				window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (window.Hwnd.Width, window.Hwnd.Height);
+				return;
+			}
+
+			WaylandTopLevelWindowManager waylandManager = form.window_manager as WaylandTopLevelWindowManager;
+			if (waylandManager != null) {
+				window.Hwnd.ClientRect = waylandManager.CalculateClientRectangle (window.Hwnd.Width, window.Hwnd.Height);
+				return;
+			}
+
+			XplatUIWin32.NCCALCSIZE_PARAMS ncp = new XplatUIWin32.NCCALCSIZE_PARAMS ();
+			ncp.rgrc1.left = 0;
+			ncp.rgrc1.top = 0;
+			ncp.rgrc1.right = window.Hwnd.Width;
+			ncp.rgrc1.bottom = window.Hwnd.Height;
+
+			IntPtr ptr = Marshal.AllocHGlobal (Marshal.SizeOf (ncp));
+			try {
+				Marshal.StructureToPtr (ncp, ptr, true);
+				// Mono's managed window manager owns the border/menu/caption
+				// math.  Feed it a real NCCALCSIZE struct instead of posting a
+				// dummy message, because InternalWindowManager dereferences
+				// lParam by design.
+				NativeWindow.WndProc (window.Hwnd.Handle, Msg.WM_NCCALCSIZE, (IntPtr) 1, ptr);
+				ncp = (XplatUIWin32.NCCALCSIZE_PARAMS) Marshal.PtrToStructure (ptr, typeof (XplatUIWin32.NCCALCSIZE_PARAMS));
+			} finally {
+				Marshal.FreeHGlobal (ptr);
+			}
+
+			window.Hwnd.ClientRect = new Rectangle (ncp.rgrc1.left, ncp.rgrc1.top,
+				Math.Max (1, ncp.rgrc1.right - ncp.rgrc1.left),
+				Math.Max (1, ncp.rgrc1.bottom - ncp.rgrc1.top));
+		}
+
 		bool IsFixedSizeToplevel (WaylandWindow window)
 		{
 			if (IsSubsurfaceWindow (window) || IsPopupWindow (window))
@@ -6737,6 +7116,9 @@ namespace System.Windows.Forms {
 
 		Size GetToplevelSurfaceSize (WaylandWindow window)
 		{
+			if (IsClientDecoratedToplevel (window))
+				return new Size (Math.Max (1, window.Hwnd.Width), Math.Max (1, window.Hwnd.Height));
+
 			Rectangle client = window.Hwnd.ClientRect;
 			return new Size (Math.Max (1, client.Width), Math.Max (1, client.Height));
 		}
@@ -6744,6 +7126,8 @@ namespace System.Windows.Forms {
 		Size TranslateWindowSizeToToplevelSurfaceSize (WaylandWindow window, Size windowSize)
 		{
 			if (windowSize == Size.Empty || windowSize.Width <= 0 || windowSize.Height <= 0)
+				return windowSize;
+			if (IsClientDecoratedToplevel (window))
 				return windowSize;
 
 			Rectangle client = window.Hwnd.GetClientRectangle (windowSize.Width, windowSize.Height);
@@ -6753,6 +7137,8 @@ namespace System.Windows.Forms {
 		Size TranslateToplevelSurfaceSizeToWindowSize (WaylandWindow window, Size surfaceSize)
 		{
 			if (surfaceSize == Size.Empty || surfaceSize.Width <= 0 || surfaceSize.Height <= 0)
+				return surfaceSize;
+			if (IsClientDecoratedToplevel (window))
 				return surfaceSize;
 
 			CreateParams cp = new CreateParams ();
@@ -6770,6 +7156,14 @@ namespace System.Windows.Forms {
 			// Control.ClientRectangle and the Graphics returned by
 			// PaintEventStart, so a whole-client invalidation starts at 0,0.
 			return new Rectangle (0, 0, Math.Max (1, client.Width), Math.Max (1, client.Height));
+		}
+
+		Rectangle GetSurfaceLocalRectangle (WaylandWindow window)
+		{
+			if (IsClientDecoratedToplevel (window))
+				return new Rectangle (0, 0, Math.Max (1, window.Hwnd.Width), Math.Max (1, window.Hwnd.Height));
+
+			return GetClientLocalRectangle (window);
 		}
 
 		bool HasPopupStyle (WaylandWindow window)
@@ -6923,6 +7317,9 @@ namespace System.Windows.Forms {
 		{
 			int x = window.Hwnd.X;
 			int y = window.Hwnd.Y;
+			Point clientOffset = GetClientSurfaceOffset (window);
+			x += clientOffset.X;
+			y += clientOffset.Y;
 			Hwnd parent = window.Hwnd.Parent;
 
 			// Child HWND coordinates are parent-relative in Mono.  Wayland
@@ -6932,10 +7329,24 @@ namespace System.Windows.Forms {
 			while (parent != null) {
 				x += parent.X;
 				y += parent.Y;
+				WaylandWindow parentWindow;
+				if (windows.TryGetValue (parent.Handle, out parentWindow)) {
+					clientOffset = GetClientSurfaceOffset (parentWindow);
+					x += clientOffset.X;
+					y += clientOffset.Y;
+				}
 				parent = parent.Parent;
 			}
 
 			return new Point (x, y);
+		}
+
+		Point GetClientSurfaceOffset (WaylandWindow window)
+		{
+			if (!IsClientDecoratedToplevel (window))
+				return Point.Empty;
+
+			return new Point (window.Hwnd.ClientRect.X, window.Hwnd.ClientRect.Y);
 		}
 
 		bool TryGetSubsurfaceGeometry (WaylandWindow window, out Point surfacePosition, out Rectangle sourceLogical)
@@ -6992,7 +7403,9 @@ namespace System.Windows.Forms {
 				}
 			}
 
-			return GetWindowScreenLocation (window);
+			Point surfaceOrigin = GetWindowScreenLocation (window);
+			Point clientOffset = GetClientSurfaceOffset (window);
+			return new Point (surfaceOrigin.X - clientOffset.X, surfaceOrigin.Y - clientOffset.Y);
 		}
 
 		void TranslateSurfacePointToWindow (WaylandWindow window, ref int x, ref int y)
@@ -7112,6 +7525,12 @@ namespace System.Windows.Forms {
 				Point targetScreen = GetWindowScreenLocation (target);
 				targetX = mousePosition.X - targetScreen.X;
 				targetY = mousePosition.Y - targetScreen.Y;
+			} else if (IsClientDecoratedToplevel (target)) {
+				Rectangle client = target.Hwnd.ClientRect;
+				if (client.Contains (targetX, targetY)) {
+					targetX -= client.X;
+					targetY -= client.Y;
+				}
 			}
 
 			return target;
@@ -7119,6 +7538,10 @@ namespace System.Windows.Forms {
 
 		void PostPointerMessage (Msg message, WaylandWindow surfaceWindow, int surfaceX, int surfaceY, int wheelDelta, uint time)
 		{
+			if (TryPostNonClientPointerMessage (message, surfaceWindow, surfaceX, surfaceY, wheelDelta, time))
+				return;
+
+			ClearNonClientHover (time);
 			int targetX;
 			int targetY;
 			WaylandWindow target = ResolvePointerTarget (surfaceWindow, surfaceX, surfaceY, out targetX, out targetY);
@@ -7126,6 +7549,148 @@ namespace System.Windows.Forms {
 				return;
 
 			PostInputMessage (target.Hwnd.Handle, message, (IntPtr) MakeMouseWParam (wheelDelta), Control.MakeParam (targetX, targetY), time);
+		}
+
+		bool TryPostNonClientPointerMessage (Msg message, WaylandWindow surfaceWindow, int surfaceX, int surfaceY, int wheelDelta, uint time)
+		{
+			if (grabWindow != IntPtr.Zero || !IsClientDecoratedToplevel (surfaceWindow))
+				return false;
+			if (surfaceWindow.Hwnd.ClientRect.Contains (surfaceX, surfaceY))
+				return false;
+
+			if (message == Msg.WM_MOUSELEAVE) {
+				ClearNonClientHover (time);
+				return true;
+			}
+
+			if (message == Msg.WM_MOUSE_ENTER)
+				return true;
+			if (message != Msg.WM_MOUSEMOVE)
+				return false;
+
+			HitTest hit = NonClientHitTest (surfaceWindow, surfaceX, surfaceY);
+			ApplyNonClientCursor (surfaceWindow, hit);
+			if (nonClientHoverWindow != null && nonClientHoverWindow != surfaceWindow)
+				ClearNonClientHover (time);
+			nonClientHoverWindow = surfaceWindow;
+			nonClientHoverPosition = new Point (surfaceX, surfaceY);
+			PostInputMessage (surfaceWindow.Hwnd.Handle, Msg.WM_NCMOUSEMOVE, (IntPtr) MakeMouseWParam (wheelDelta), Control.MakeParam (surfaceX, surfaceY), time);
+			return true;
+		}
+
+		bool TryPostNonClientButtonMessage (WaylandWindow surfaceWindow, Msg down, Msg up, Msg dblclk, uint state, uint time)
+		{
+			if (grabWindow != IntPtr.Zero || !IsClientDecoratedToplevel (surfaceWindow))
+				return false;
+
+			int x = pointerSurfacePosition.X;
+			int y = pointerSurfacePosition.Y;
+			if (surfaceWindow.Hwnd.ClientRect.Contains (x, y))
+				return false;
+
+			HitTest hit = NonClientHitTest (surfaceWindow, x, y);
+			Msg message;
+			if (state == WaylandProtocol.WlPointer.ButtonStatePressed) {
+				ActivateForInput (surfaceWindow);
+				SetFocusWindow (surfaceWindow.Hwnd.Handle);
+				Msg nonClientDown = ToNonClientDownMessage (down);
+				Msg nonClientDoubleClick = ToNonClientDoubleClickMessage (dblclk);
+				message = IsDoubleClick (surfaceWindow.Hwnd.Handle, nonClientDown, x, y, time) ? nonClientDoubleClick : nonClientDown;
+				PostInputMessage (surfaceWindow.Hwnd.Handle, message, (IntPtr) hit, Control.MakeParam (x, y), time, lastInputSerial);
+				lastClickWindow = surfaceWindow.Hwnd.Handle;
+				lastClickMessage = nonClientDown;
+				lastClickX = x;
+				lastClickY = y;
+				lastClickTime = time;
+			} else {
+				message = ToNonClientUpMessage (up);
+				PostInputMessage (surfaceWindow.Hwnd.Handle, message, (IntPtr) MakeMouseWParam (0), Control.MakeParam (x, y), time, lastInputSerial);
+			}
+			return true;
+		}
+
+		void ClearNonClientHover (uint time)
+		{
+			if (nonClientHoverWindow == null)
+				return;
+
+			WaylandWindow old = nonClientHoverWindow;
+			Point position = nonClientHoverPosition;
+			nonClientHoverWindow = null;
+			PostInputMessage (old.Hwnd.Handle, Msg.WM_NCMOUSELEAVE, (IntPtr) MakeMouseWParam (0), Control.MakeParam (position.X, position.Y), time);
+			if (pointerWindow != null)
+				ApplyCursor (pointerWindow);
+		}
+
+		HitTest NonClientHitTest (WaylandWindow window, int x, int y)
+		{
+			IntPtr result = NativeWindow.WndProc (window.Hwnd.Handle, Msg.WM_NCHITTEST, IntPtr.Zero, Control.MakeParam (x, y));
+			if (result != IntPtr.Zero)
+				return (HitTest) result.ToInt32 ();
+			if (window.Hwnd.ClientRect.Contains (x, y))
+				return HitTest.HTCLIENT;
+			return HitTest.HTNOWHERE;
+		}
+
+		void ApplyNonClientCursor (WaylandWindow window, HitTest hit)
+		{
+			StdCursor cursor;
+			switch (hit) {
+			case HitTest.HTLEFT:
+			case HitTest.HTRIGHT:
+				cursor = StdCursor.SizeWE;
+				break;
+			case HitTest.HTTOP:
+			case HitTest.HTBOTTOM:
+				cursor = StdCursor.SizeNS;
+				break;
+			case HitTest.HTTOPLEFT:
+			case HitTest.HTBOTTOMRIGHT:
+				cursor = StdCursor.SizeNWSE;
+				break;
+			case HitTest.HTTOPRIGHT:
+			case HitTest.HTBOTTOMLEFT:
+				cursor = StdCursor.SizeNESW;
+				break;
+			default:
+				cursor = StdCursor.Default;
+				break;
+			}
+
+			ApplyCursor (window, DefineStdCursor (cursor));
+		}
+
+		Msg ToNonClientDownMessage (Msg message)
+		{
+			if (message == Msg.WM_LBUTTONDOWN)
+				return Msg.WM_NCLBUTTONDOWN;
+			if (message == Msg.WM_RBUTTONDOWN)
+				return Msg.WM_NCRBUTTONDOWN;
+			if (message == Msg.WM_MBUTTONDOWN)
+				return Msg.WM_NCMBUTTONDOWN;
+			return message;
+		}
+
+		Msg ToNonClientUpMessage (Msg message)
+		{
+			if (message == Msg.WM_LBUTTONUP)
+				return Msg.WM_NCLBUTTONUP;
+			if (message == Msg.WM_RBUTTONUP)
+				return Msg.WM_NCRBUTTONUP;
+			if (message == Msg.WM_MBUTTONUP)
+				return Msg.WM_NCMBUTTONUP;
+			return message;
+		}
+
+		Msg ToNonClientDoubleClickMessage (Msg message)
+		{
+			if (message == Msg.WM_LBUTTONDBLCLK)
+				return Msg.WM_NCLBUTTONDBLCLK;
+			if (message == Msg.WM_RBUTTONDBLCLK)
+				return Msg.WM_NCRBUTTONDBLCLK;
+			if (message == Msg.WM_MBUTTONDBLCLK)
+				return Msg.WM_NCMBUTTONDBLCLK;
+			return message;
 		}
 
 		bool TryGetMouseMessages (uint button, out MouseButtons managedButton, out Msg down, out Msg up, out Msg dblclk)

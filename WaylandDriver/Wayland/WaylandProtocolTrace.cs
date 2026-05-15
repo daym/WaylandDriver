@@ -278,6 +278,17 @@ namespace WaylandDriver.Wayland {
 			if (iface == "xdg_toplevel" && name == "set_parent" && reader.TryReadUInt32 (out a))
 				return ObjectName (a);
 
+			if (iface == "xdg_toplevel" && name == "move" &&
+			    reader.TryReadUInt32 (out a) &&
+			    reader.TryReadUInt32 (out b))
+				return "seat=" + ObjectName (a) + ", serial=" + b.ToString ();
+
+			if (iface == "xdg_toplevel" && name == "resize" &&
+			    reader.TryReadUInt32 (out a) &&
+			    reader.TryReadUInt32 (out b) &&
+			    reader.TryReadUInt32 (out c))
+				return "seat=" + ObjectName (a) + ", serial=" + b.ToString () + ", edges=" + XdgToplevelResizeEdgeName (c);
+
 			if (iface == "zxdg_decoration_manager_v1" && name == "get_toplevel_decoration" &&
 			    reader.TryReadUInt32 (out a) &&
 			    reader.TryReadUInt32 (out b))
@@ -559,6 +570,10 @@ namespace WaylandDriver.Wayland {
 					return "set_title";
 				if (opcode == WaylandProtocol.XdgToplevel.SetAppId)
 					return "set_app_id";
+				if (opcode == WaylandProtocol.XdgToplevel.Move)
+					return "move";
+				if (opcode == WaylandProtocol.XdgToplevel.Resize)
+					return "resize";
 				if (opcode == WaylandProtocol.XdgToplevel.SetMaxSize)
 					return "set_max_size";
 				if (opcode == WaylandProtocol.XdgToplevel.SetMinSize)
@@ -736,6 +751,29 @@ namespace WaylandDriver.Wayland {
 			if (mode == WaylandProtocol.ZxdgToplevelDecorationV1.ModeServerSide)
 				return "server_side";
 			return mode.ToString ();
+		}
+
+		static string XdgToplevelResizeEdgeName (uint edge)
+		{
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeNone)
+				return "none";
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeTop)
+				return "top";
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeBottom)
+				return "bottom";
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeLeft)
+				return "left";
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeTopLeft)
+				return "top_left";
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeBottomLeft)
+				return "bottom_left";
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeRight)
+				return "right";
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeTopRight)
+				return "top_right";
+			if (edge == WaylandProtocol.XdgToplevel.ResizeEdgeBottomRight)
+				return "bottom_right";
+			return edge.ToString ();
 		}
 
 		static string FormatRawBytes (byte [] data)
