@@ -1,0 +1,36 @@
+diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/Control.cs b/mcs/class/System.Windows.Forms/System.Windows.Forms/Control.cs
+index 5b1e913..7bd86de 100644
+--- a/mcs/class/System.Windows.Forms/System.Windows.Forms/Control.cs
++++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/Control.cs
+@@ -3603,7 +3603,7 @@
+ 			if (!IsHandleCreated) {
+ 				this.CreateHandle();
+ 			}
+-			return Graphics.FromHwnd(this.window.Handle);
++			return XplatUI.CreateGraphics (this.window.Handle);
+ 		}
+ 
+ 		public DragDropEffects DoDragDrop(object data, DragDropEffects allowedEffects) {
+diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs b/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs
+index f254e69..b224ff5 100644
+--- a/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs
++++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs
+@@ -788,6 +788,17 @@
+ 			driver.InvalidateNC (handle);
+ 		}
+ 
++		internal static Graphics CreateGraphics (IntPtr handle)
++		{
++			DriverDebug ("CreateGraphics ({0}): Called", Window (handle));
++			var createGraphics = driver.GetType ().GetMethod (
++				"CreateGraphics",
++				System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic,
++				null,
++				new Type [] { typeof (IntPtr) },
++				null);
++			return createGraphics == null ? Graphics.FromHwnd (handle) : (Graphics) createGraphics.Invoke (driver, new object [] { handle });
++		}
+ 
+ 		internal static bool IsEnabled (IntPtr handle)
+ 		{
+ 			#if DriverDebug || DriverDebugState

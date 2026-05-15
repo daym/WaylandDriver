@@ -13,11 +13,29 @@ guix shell -m ../manifest.scm -- xbuild WaylandDriver.sln
 MONO_MWF_DRIVER=/path/to/WaylandDriver/WaylandDriver/bin/Debug/CocoaDriver.dll mono app.exe
 ```
 
+There is also a small control-gallery sample at `../samples/ControlGallery`. From the repository root:
+
+```sh
+./run-control-gallery-wayland.sh
+```
+
+Text/edit controls in stock Mono 6 still call `Graphics.FromHwnd` directly through
+`Control.CreateGraphics()`. On Linux that enters the X11/libgdiplus path even when
+`MONO_MWF_DRIVER` is set. Apply `mono-6-wayland-creategraphics.patch` to Mono's
+`System.Windows.Forms` source before using the full control gallery with text
+controls; otherwise `TextBox`, `MaskedTextBox`, and `RichTextBox` will fail on a
+pure Wayland session with an X-server/display error.
+
 The output assembly is intentionally named `CocoaDriver.dll` for now. Mono 6.12 grants internal WinForms access to an assembly named `CocoaDriver` signed by `../CocoaDriver/CocoaKey.snk`; it does not grant that access to `WaylandDriver`. This lets the driver build against stock Mono 6 installations that include the Cocoa friend-assembly patch.
 
 The project compiles against Mono's runtime `System.Windows.Forms.dll`, not the `*-api` reference assembly, because the driver needs internal WinForms types such as `XplatUIDriver`, `Hwnd`, `Msg`, and `MSG`.
 
 For a clean assembly name, patch Mono's `System.Windows.Forms` assembly to add an `InternalsVisibleTo` entry for `WaylandDriver` with the same public key, then change `<AssemblyName>CocoaDriver</AssemblyName>` to `<AssemblyName>WaylandDriver</AssemblyName>` in `WaylandDriver/WaylandDriver.csproj`.
+
+The separate `mono-6-wayland-creategraphics.patch` keeps the default behavior for
+existing drivers, but lets a loadable driver provide `CreateGraphics(IntPtr)`.
+This driver returns a `Graphics` backed by the managed window backbuffer, avoiding
+the X11-only `Graphics.FromHwnd` path.
 
 ## Current state
 
