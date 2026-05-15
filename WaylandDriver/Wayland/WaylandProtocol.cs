@@ -73,17 +73,84 @@ namespace WaylandDriver.Wayland {
 			public const ushort Scale = 3;
 		}
 
+		internal static class WlSeat {
+			public const ushort GetPointer = 0;
+			public const ushort GetKeyboard = 1;
+
+			public const ushort Capabilities = 0;
+			public const ushort Name = 1;
+
+			public const uint CapabilityPointer = 1;
+			public const uint CapabilityKeyboard = 2;
+		}
+
+		internal static class WlPointer {
+			public const ushort Release = 0;
+
+			public const ushort Enter = 0;
+			public const ushort Leave = 1;
+			public const ushort Motion = 2;
+			public const ushort Button = 3;
+			public const ushort Axis = 4;
+			public const ushort Frame = 5;
+			public const ushort AxisSource = 6;
+			public const ushort AxisStop = 7;
+			public const ushort AxisDiscrete = 8;
+
+			public const uint ButtonLeft = 0x110;
+			public const uint ButtonRight = 0x111;
+			public const uint ButtonMiddle = 0x112;
+			public const uint ButtonStateReleased = 0;
+			public const uint ButtonStatePressed = 1;
+			public const uint AxisVerticalScroll = 0;
+		}
+
+		internal static class WlKeyboard {
+			public const ushort Release = 0;
+
+			public const ushort Keymap = 0;
+			public const ushort Enter = 1;
+			public const ushort Leave = 2;
+			public const ushort Key = 3;
+			public const ushort Modifiers = 4;
+			public const ushort RepeatInfo = 5;
+
+			public const uint KeyStateReleased = 0;
+			public const uint KeyStatePressed = 1;
+		}
+
 		internal static class XdgWmBase {
 			public const ushort Destroy = 0;
+			public const ushort CreatePositioner = 1;
 			public const ushort GetXdgSurface = 2;
 			public const ushort Pong = 3;
 
 			public const ushort Ping = 0;
 		}
 
+		internal static class XdgPositioner {
+			public const ushort Destroy = 0;
+			public const ushort SetSize = 1;
+			public const ushort SetAnchorRect = 2;
+			public const ushort SetAnchor = 3;
+			public const ushort SetGravity = 4;
+			public const ushort SetConstraintAdjustment = 5;
+			public const ushort SetOffset = 6;
+
+			public const uint AnchorTopLeft = 5;
+			public const uint GravityBottomRight = 8;
+			public const uint ConstraintAdjustmentSlideX = 1;
+			public const uint ConstraintAdjustmentSlideY = 2;
+			public const uint ConstraintAdjustmentFlipX = 4;
+			public const uint ConstraintAdjustmentFlipY = 8;
+			public const uint ConstraintAdjustmentResizeX = 16;
+			public const uint ConstraintAdjustmentResizeY = 32;
+		}
+
 		internal static class XdgSurface {
 			public const ushort Destroy = 0;
 			public const ushort GetToplevel = 1;
+			public const ushort GetPopup = 2;
 			public const ushort AckConfigure = 4;
 
 			public const ushort Configure = 0;
@@ -101,6 +168,15 @@ namespace WaylandDriver.Wayland {
 
 			public const ushort Configure = 0;
 			public const ushort Close = 1;
+		}
+
+		internal static class XdgPopup {
+			public const ushort Destroy = 0;
+			public const ushort Grab = 1;
+
+			public const ushort Configure = 0;
+			public const ushort PopupDone = 1;
+			public const ushort Repositioned = 2;
 		}
 	}
 }

@@ -20,6 +20,7 @@ namespace System.Windows.Forms {
 			public uint SubsurfaceId;
 			public uint XdgSurfaceId;
 			public uint XdgToplevelId;
+			public uint XdgPopupId;
 			public bool XdgConfigured;
 			public readonly List<WaylandShmBuffer> Buffers = new List<WaylandShmBuffer> ();
 			public readonly HashSet<uint> EnteredOutputs = new HashSet<uint> ();
@@ -54,6 +55,17 @@ namespace System.Windows.Forms {
 		sealed class WaylandOutput {
 			public uint ObjectId;
 			public int Scale = 1;
+		}
+
+		sealed class WaylandCaret {
+			public Timer Timer;
+			public IntPtr Hwnd;
+			public int X;
+			public int Y;
+			public int Width = 1;
+			public int Height = 1;
+			public bool Visible;
+			public bool On;
 		}
 
 		// Mono's Control.DoubleBuffer uses XplatUI offscreen drawables.  These
@@ -107,6 +119,9 @@ namespace System.Windows.Forms {
 		readonly List<IntPtr> zOrder = new List<IntPtr> ();
 		readonly List<Timer> timers = new List<Timer> ();
 		readonly Bitmap fallbackBitmap = new Bitmap (1, 1, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+		readonly HashSet<uint> evdevKeysDown = new HashSet<uint> ();
+		readonly Dictionary<string, char> keyText = new Dictionary<string, char> ();
+		readonly WaylandCaret caret = new WaylandCaret ();
 
 		WaylandConnection connection;
 		WaylandRegistry registry;
@@ -114,11 +129,26 @@ namespace System.Windows.Forms {
 		uint subcompositorId;
 		uint shmId;
 		uint xdgWmBaseId;
+		uint seatId;
+		uint pointerId;
+		uint keyboardId;
+		uint lastInputSerial;
 		int nextHandle = 0x4000;
 		IntPtr activeWindow = IntPtr.Zero;
 		IntPtr focusWindow = IntPtr.Zero;
 		IntPtr grabWindow = IntPtr.Zero;
 		IntPtr overrideCursor = IntPtr.Zero;
+		WaylandWindow pointerWindow;
+		WaylandWindow keyboardWindow;
+		Point pointerSurfacePosition;
+		Point mousePosition;
+		MouseButtons mouseButtons;
+		Keys modifierKeys;
+		IntPtr lastClickWindow = IntPtr.Zero;
+		Msg lastClickMessage;
+		int lastClickX;
+		int lastClickY;
+		uint lastClickTime;
 		bool themesEnabled;
 		bool quitPosted;
 
@@ -172,6 +202,10 @@ namespace System.Windows.Forms {
 			get { return 3; }
 		}
 
+		internal override MouseButtons MouseButtons {
+			get { return mouseButtons; }
+		}
+
 		internal override bool MouseButtonsSwapped {
 			get { return false; }
 		}
@@ -209,6 +243,10 @@ namespace System.Windows.Forms {
 			get { return 1; }
 		}
 
+		internal override Keys ModifierKeys {
+			get { return modifierKeys; }
+		}
+
 		internal override IntPtr InitializeDriver ()
 		{
 			connection = WaylandConnection.ConnectFromEnvironment ();
@@ -217,6 +255,7 @@ namespace System.Windows.Forms {
 			subcompositorId = connection.Bind (registry, "wl_subcompositor", 1);
 			shmId = connection.Bind (registry, "wl_shm", 1);
 			xdgWmBaseId = connection.Bind (registry, "xdg_wm_base", 3);
+			seatId = connection.Bind (registry, "wl_seat", 5);
 			BindOutputs ();
 
 			if (compositorId == 0)
@@ -227,6 +266,9 @@ namespace System.Windows.Forms {
 				throw new InvalidOperationException ("The Wayland compositor did not advertise wl_shm.");
 			if (xdgWmBaseId == 0)
 				throw new InvalidOperationException ("The Wayland compositor did not advertise xdg_wm_base.");
+			// Input is optional at the protocol level.  A compositor without
+			// wl_seat can still render windows, but there is no native source for
+			// pointer or keyboard messages to feed into Mono's normal queue.
 
 			return (IntPtr) 1;
 		}
@@ -242,6 +284,8 @@ namespace System.Windows.Forms {
 			waylandObjects.Clear ();
 			waylandBuffers.Clear ();
 			waylandOutputs.Clear ();
+			evdevKeysDown.Clear ();
+			keyText.Clear ();
 
 			if (connection != null)
 				connection.Dispose ();
@@ -351,6 +395,12 @@ namespace System.Windows.Forms {
 				activeWindow = IntPtr.Zero;
 			if (focusWindow == handle)
 				focusWindow = IntPtr.Zero;
+			if (grabWindow == handle)
+				grabWindow = IntPtr.Zero;
+			if (pointerWindow == window)
+				pointerWindow = null;
+			if (keyboardWindow == window)
+				keyboardWindow = null;
 		}
 
 		internal override FormWindowState GetWindowState (IntPtr handle)
@@ -482,10 +532,17 @@ namespace System.Windows.Forms {
 				EnsureNativeWindow (window);
 				if (IsSubsurfaceWindow (window))
 					Invalidate (handle, Rectangle.Empty, false);
-				if (activate && !IsSubsurfaceWindow (window))
+				if (activate && !IsSubsurfaceWindow (window) && !IsPopupWindow (window))
 					Activate (handle);
 			} else {
-				UnmapNativeWindow (window);
+				if (IsPopupWindow (window)) {
+					// xdg_popup is a transient interaction role, not just a
+					// hidden toplevel.  Destroy it on hide so the next show gets a
+					// fresh positioner and input serial for the popup grab.
+					DestroyNativeWindow (window);
+				} else {
+					UnmapNativeWindow (window);
+				}
 			}
 
 			PostMessage (handle, Msg.WM_SHOWWINDOW, visible ? (IntPtr) 1 : IntPtr.Zero, IntPtr.Zero);
@@ -668,12 +725,21 @@ namespace System.Windows.Forms {
 
 			int oldWidth = window.Hwnd.Width;
 			int oldHeight = window.Hwnd.Height;
+			bool popupRolePositionChanged = window.XdgPopupId != 0 &&
+				(window.Hwnd.X != x || window.Hwnd.Y != y || oldWidth != width || oldHeight != height);
 
 			window.Hwnd.X = x;
 			window.Hwnd.Y = y;
 			window.Hwnd.Width = Math.Max (1, width);
 			window.Hwnd.Height = Math.Max (1, height);
 			window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (window.Hwnd.Width, window.Hwnd.Height);
+			if (popupRolePositionChanged) {
+				// xdg_popup geometry comes from the immutable xdg_positioner used
+				// at role creation.  When Mono moves/resizes a visible popup HWND,
+				// recreate the surface role so the compositor gets the new anchor.
+				DestroyNativeWindow (window);
+				EnsureNativeWindow (window);
+			}
 			UpdateSubsurfacePosition (window);
 			PostMessage (handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
 
@@ -707,9 +773,8 @@ namespace System.Windows.Forms {
 				return;
 
 			activeWindow = handle;
-			focusWindow = handle;
 			PostMessage (handle, Msg.WM_ACTIVATE, (IntPtr) WindowActiveFlags.WA_ACTIVE, IntPtr.Zero);
-			PostMessage (handle, Msg.WM_SETFOCUS, IntPtr.Zero, IntPtr.Zero);
+			SetFocusWindow (handle);
 		}
 
 		internal override void EnableWindow (IntPtr handle, bool enable)
@@ -820,6 +885,18 @@ namespace System.Windows.Forms {
 
 		internal override bool TranslateMessage (ref MSG msg)
 		{
+			char ch;
+			string key = GetKeyTextKey (msg);
+			if (!keyText.TryGetValue (key, out ch))
+				return true;
+
+			keyText.Remove (key);
+			// Mono's Application loop calls TranslateMessage between its
+			// keyboard-capture/preprocessing checks and DispatchMessage.  Post
+			// WM_CHAR here, not directly from wl_keyboard.key, so shortcut and
+			// dialog-key filtering sees the same message order as the other
+			// native drivers.
+			PostInputMessage (msg.hwnd, msg.message == Msg.WM_SYSKEYDOWN ? Msg.WM_SYSCHAR : Msg.WM_CHAR, (IntPtr) ch, msg.lParam, msg.time);
 			return true;
 		}
 
@@ -865,7 +942,20 @@ namespace System.Windows.Forms {
 			WaylandWindow window;
 			if (!windows.TryGetValue (hWnd, out window))
 				return false;
+			bool wasPopup = IsPopupWindow (window);
 			window.Hwnd.owner = hWndOwner == IntPtr.Zero ? null : Hwnd.ObjectFromHandle (hWndOwner);
+			bool isPopup = IsPopupWindow (window);
+			if (wasPopup != isPopup && window.SurfaceId != 0) {
+				// ComboBox and ToolStrip popup HWNDs may be shown before Mono
+				// assigns their owner.  Wayland roles are immutable once a
+				// surface has become xdg_toplevel/xdg_popup, so ownership changes
+				// require recreating the native surface with the correct role.
+				DestroyNativeWindow (window);
+				if (window.Hwnd.visible) {
+					EnsureNativeWindow (window);
+					Invalidate (hWnd, Rectangle.Empty, false);
+				}
+			}
 			return true;
 		}
 
@@ -938,8 +1028,8 @@ namespace System.Windows.Forms {
 
 		internal override void GetCursorPos (IntPtr hwnd, out int x, out int y)
 		{
-			x = 0;
-			y = 0;
+			x = mousePosition.X;
+			y = mousePosition.Y;
 		}
 
 		internal override void SetCursorPos (IntPtr hwnd, int x, int y)
@@ -951,8 +1041,9 @@ namespace System.Windows.Forms {
 			WaylandWindow window;
 			if (!windows.TryGetValue (hwnd, out window))
 				return;
-			x -= window.Hwnd.X;
-			y -= window.Hwnd.Y;
+			Point screen = GetWindowScreenLocation (window);
+			x -= screen.X;
+			y -= screen.Y;
 		}
 
 		internal override void ClientToScreen (IntPtr hwnd, ref int x, ref int y)
@@ -960,12 +1051,15 @@ namespace System.Windows.Forms {
 			WaylandWindow window;
 			if (!windows.TryGetValue (hwnd, out window))
 				return;
-			x += window.Hwnd.X;
-			y += window.Hwnd.Y;
+			Point screen = GetWindowScreenLocation (window);
+			x += screen.X;
+			y += screen.Y;
 		}
 
 		internal override void GrabWindow (IntPtr hwnd, IntPtr confineToHwnd)
 		{
+			if (grabWindow != IntPtr.Zero && grabWindow != hwnd)
+				SendMessage (grabWindow, Msg.WM_CAPTURECHANGED, IntPtr.Zero, IntPtr.Zero);
 			grabWindow = hwnd;
 		}
 
@@ -978,8 +1072,12 @@ namespace System.Windows.Forms {
 
 		internal override void UngrabWindow (IntPtr hwnd)
 		{
-			if (grabWindow == hwnd)
+			if (grabWindow == hwnd) {
 				grabWindow = IntPtr.Zero;
+				// Control.Capture relies on WM_CAPTURECHANGED to clear managed
+				// capture state when the driver releases a grab.
+				SendMessage (hwnd, Msg.WM_CAPTURECHANGED, IntPtr.Zero, IntPtr.Zero);
+			}
 		}
 
 		internal override void SendAsyncMethod (AsyncMethodData method)
@@ -1025,10 +1123,7 @@ namespace System.Windows.Forms {
 
 		internal override void SetFocus (IntPtr hwnd)
 		{
-			if (windows.ContainsKey (hwnd)) {
-				focusWindow = hwnd;
-				PostMessage (hwnd, Msg.WM_SETFOCUS, IntPtr.Zero, IntPtr.Zero);
-			}
+			SetFocusWindow (hwnd);
 		}
 
 		internal override IntPtr GetActive ()
@@ -1264,6 +1359,11 @@ namespace System.Windows.Forms {
 				return;
 			}
 
+			if (IsPopupWindow (window)) {
+				CreatePopupNativeWindow (window);
+				return;
+			}
+
 			window.SurfaceId = connection.AllocateId ();
 			window.XdgSurfaceId = connection.AllocateId ();
 			window.XdgToplevelId = connection.AllocateId ();
@@ -1294,6 +1394,93 @@ namespace System.Windows.Forms {
 			waylandObjects [window.XdgToplevelId] = window;
 		}
 
+		void CreatePopupNativeWindow (WaylandWindow window)
+		{
+			WaylandWindow parent = GetPopupParentWindow (window);
+			if (parent == null)
+				return;
+
+			EnsureNativeWindow (parent);
+			if (parent.XdgSurfaceId == 0)
+				return;
+
+			window.SurfaceId = connection.AllocateId ();
+			window.XdgSurfaceId = connection.AllocateId ();
+			window.XdgPopupId = connection.AllocateId ();
+			uint positionerId = connection.AllocateId ();
+			window.BufferScale = parent.BufferScale;
+
+			Point parentScreen = GetWindowScreenLocation (parent);
+			Point popupScreen = GetWindowScreenLocation (window);
+			int relativeX = popupScreen.X - parentScreen.X;
+			int relativeY = popupScreen.Y - parentScreen.Y;
+			int width = Math.Max (1, window.Hwnd.Width);
+			int height = Math.Max (1, window.Hwnd.Height);
+
+			connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (window.SurfaceId);
+			});
+			connection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.GetXdgSurface, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (window.XdgSurfaceId);
+				b.WriteObject (window.SurfaceId);
+			});
+			connection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.CreatePositioner, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (positionerId);
+			});
+			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetSize, delegate (WaylandRequestBuilder b) {
+				b.WriteInt32 (width);
+				b.WriteInt32 (height);
+			});
+			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetAnchorRect, delegate (WaylandRequestBuilder b) {
+				b.WriteInt32 (relativeX);
+				b.WriteInt32 (relativeY);
+				b.WriteInt32 (1);
+				b.WriteInt32 (1);
+			});
+			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetAnchor, delegate (WaylandRequestBuilder b) {
+				b.WriteUInt32 (WaylandProtocol.XdgPositioner.AnchorTopLeft);
+			});
+			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetGravity, delegate (WaylandRequestBuilder b) {
+				b.WriteUInt32 (WaylandProtocol.XdgPositioner.GravityBottomRight);
+			});
+			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetConstraintAdjustment, delegate (WaylandRequestBuilder b) {
+				b.WriteUInt32 (WaylandProtocol.XdgPositioner.ConstraintAdjustmentSlideX |
+					WaylandProtocol.XdgPositioner.ConstraintAdjustmentSlideY |
+					WaylandProtocol.XdgPositioner.ConstraintAdjustmentFlipX |
+					WaylandProtocol.XdgPositioner.ConstraintAdjustmentFlipY |
+					WaylandProtocol.XdgPositioner.ConstraintAdjustmentResizeX |
+					WaylandProtocol.XdgPositioner.ConstraintAdjustmentResizeY);
+			});
+			// Owned WinForms popup HWNDs are not independent application
+			// windows.  xdg_popup gives the compositor the same relationship
+			// that Mono expresses through Hwnd.owner, including outside-click
+			// dismissal for grabbed popup menus and combo lists.
+			connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.GetPopup, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (window.XdgPopupId);
+				b.WriteObject (parent.XdgSurfaceId);
+				b.WriteObject (positionerId);
+			});
+			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.Destroy, null);
+			if (seatId != 0 && lastInputSerial != 0) {
+				// The xdg_popup grab is tied to a user-input serial by design;
+				// without that serial the compositor must reject the grab.  The
+				// popup still maps, but outside-click dismissal is compositor
+				// managed only for user-triggered popups.
+				connection.SendRequest (window.XdgPopupId, WaylandProtocol.XdgPopup.Grab, delegate (WaylandRequestBuilder b) {
+					b.WriteObject (seatId);
+					b.WriteUInt32 (lastInputSerial);
+				});
+			}
+			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+				b.WriteInt32 (window.BufferScale);
+			});
+			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+
+			waylandObjects [window.SurfaceId] = window;
+			waylandObjects [window.XdgSurfaceId] = window;
+			waylandObjects [window.XdgPopupId] = window;
+		}
+
 		void DestroyNativeWindow (WaylandWindow window)
 		{
 			if (connection == null)
@@ -1305,6 +1492,8 @@ namespace System.Windows.Forms {
 			}
 			window.Buffers.Clear ();
 
+			if (window.XdgPopupId != 0)
+				connection.SendRequest (window.XdgPopupId, WaylandProtocol.XdgPopup.Destroy, null);
 			if (window.XdgToplevelId != 0)
 				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.Destroy, null);
 			if (window.XdgSurfaceId != 0)
@@ -1318,10 +1507,12 @@ namespace System.Windows.Forms {
 			waylandObjects.Remove (window.SubsurfaceId);
 			waylandObjects.Remove (window.XdgSurfaceId);
 			waylandObjects.Remove (window.XdgToplevelId);
+			waylandObjects.Remove (window.XdgPopupId);
 			window.SurfaceId = 0;
 			window.SubsurfaceId = 0;
 			window.XdgSurfaceId = 0;
 			window.XdgToplevelId = 0;
+			window.XdgPopupId = 0;
 			window.XdgConfigured = false;
 		}
 
@@ -1390,6 +1581,21 @@ namespace System.Windows.Forms {
 				return;
 			}
 
+			if (message.ObjectId == seatId) {
+				HandleSeatMessage (message);
+				return;
+			}
+
+			if (message.ObjectId == pointerId) {
+				HandlePointerMessage (message);
+				return;
+			}
+
+			if (message.ObjectId == keyboardId) {
+				HandleKeyboardMessage (message);
+				return;
+			}
+
 			WaylandOutput output;
 			if (waylandOutputs.TryGetValue (message.ObjectId, out output)) {
 				HandleOutputMessage (output, message);
@@ -1439,6 +1645,293 @@ namespace System.Windows.Forms {
 					return;
 				}
 			}
+
+			if (message.ObjectId == window.XdgPopupId) {
+				HandlePopupMessage (window, message);
+				return;
+			}
+		}
+
+		void HandleSeatMessage (WaylandMessage message)
+		{
+			if (message.Opcode != WaylandProtocol.WlSeat.Capabilities)
+				return;
+
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+			uint capabilities = reader.ReadUInt32 ();
+
+			if ((capabilities & WaylandProtocol.WlSeat.CapabilityPointer) != 0) {
+				if (pointerId == 0) {
+					pointerId = connection.AllocateId ();
+					connection.SendRequest (seatId, WaylandProtocol.WlSeat.GetPointer, delegate (WaylandRequestBuilder b) {
+						b.WriteNewId (pointerId);
+					});
+				}
+			} else if (pointerId != 0) {
+				connection.SendRequest (pointerId, WaylandProtocol.WlPointer.Release, null);
+				pointerId = 0;
+				pointerWindow = null;
+				mouseButtons = MouseButtons.None;
+			}
+
+			if ((capabilities & WaylandProtocol.WlSeat.CapabilityKeyboard) != 0) {
+				if (keyboardId == 0) {
+					keyboardId = connection.AllocateId ();
+					connection.SendRequest (seatId, WaylandProtocol.WlSeat.GetKeyboard, delegate (WaylandRequestBuilder b) {
+						b.WriteNewId (keyboardId);
+					});
+				}
+			} else if (keyboardId != 0) {
+				connection.SendRequest (keyboardId, WaylandProtocol.WlKeyboard.Release, null);
+				keyboardId = 0;
+				keyboardWindow = null;
+				evdevKeysDown.Clear ();
+				modifierKeys = Keys.None;
+			}
+		}
+
+		void HandlePointerMessage (WaylandMessage message)
+		{
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+
+			switch (message.Opcode) {
+			case WaylandProtocol.WlPointer.Enter: {
+				lastInputSerial = reader.ReadUInt32 ();
+				uint surfaceId = reader.ReadUInt32 ();
+				int x = FixedToInt (reader.ReadInt32 ());
+				int y = FixedToInt (reader.ReadInt32 ());
+
+				WaylandWindow window;
+				if (!waylandObjects.TryGetValue (surfaceId, out window))
+					return;
+
+				pointerWindow = window;
+				UpdatePointerPosition (window, x, y);
+				PostPointerMessage (Msg.WM_MOUSE_ENTER, window, x, y, 0, CurrentMessageTime ());
+				PostPointerMessage (Msg.WM_MOUSEMOVE, window, x, y, 0, CurrentMessageTime ());
+				return;
+			}
+
+			case WaylandProtocol.WlPointer.Leave: {
+				lastInputSerial = reader.ReadUInt32 ();
+				uint surfaceId = reader.ReadUInt32 ();
+
+				WaylandWindow window;
+				if (!waylandObjects.TryGetValue (surfaceId, out window))
+					return;
+
+				if (grabWindow == IntPtr.Zero)
+					PostPointerMessage (Msg.WM_MOUSELEAVE, window, pointerSurfacePosition.X, pointerSurfacePosition.Y, 0, CurrentMessageTime ());
+				if (pointerWindow == window)
+					pointerWindow = null;
+				return;
+			}
+
+			case WaylandProtocol.WlPointer.Motion: {
+				uint time = reader.ReadUInt32 ();
+				int x = FixedToInt (reader.ReadInt32 ());
+				int y = FixedToInt (reader.ReadInt32 ());
+				if (pointerWindow == null)
+					return;
+
+				UpdatePointerPosition (pointerWindow, x, y);
+				PostPointerMessage (Msg.WM_MOUSEMOVE, pointerWindow, x, y, 0, time);
+				return;
+			}
+
+			case WaylandProtocol.WlPointer.Button:
+				HandlePointerButton (reader);
+				return;
+
+			case WaylandProtocol.WlPointer.Axis:
+				HandlePointerAxis (reader);
+				return;
+			}
+		}
+
+		void HandlePointerButton (WaylandMessageReader reader)
+		{
+			lastInputSerial = reader.ReadUInt32 ();
+			uint time = reader.ReadUInt32 ();
+			uint button = reader.ReadUInt32 ();
+			uint state = reader.ReadUInt32 ();
+
+			Msg down;
+			Msg up;
+			Msg dblclk;
+			MouseButtons managedButton;
+			if (!TryGetMouseMessages (button, out managedButton, out down, out up, out dblclk))
+				return;
+
+			if (state == WaylandProtocol.WlPointer.ButtonStatePressed)
+				mouseButtons |= managedButton;
+			else
+				mouseButtons &= ~managedButton;
+
+			WaylandWindow surfaceWindow = pointerWindow;
+			if (surfaceWindow == null)
+				return;
+
+			int targetX;
+			int targetY;
+			WaylandWindow target = ResolvePointerTarget (surfaceWindow, pointerSurfacePosition.X, pointerSurfacePosition.Y, out targetX, out targetY);
+			if (target == null)
+				return;
+
+			if (state == WaylandProtocol.WlPointer.ButtonStatePressed) {
+				ActivateForInput (target);
+				SetFocusWindow (target.Hwnd.Handle);
+				SendParentNotify (target.Hwnd.Handle, down, targetX, targetY);
+				Msg message = IsDoubleClick (target.Hwnd.Handle, down, targetX, targetY, time) ? dblclk : down;
+				PostInputMessage (target.Hwnd.Handle, message, (IntPtr) MakeMouseWParam (0), Control.MakeParam (targetX, targetY), time);
+				lastClickWindow = target.Hwnd.Handle;
+				lastClickMessage = down;
+				lastClickX = targetX;
+				lastClickY = targetY;
+				lastClickTime = time;
+			} else {
+				PostInputMessage (target.Hwnd.Handle, up, (IntPtr) MakeMouseWParam (0), Control.MakeParam (targetX, targetY), time);
+			}
+		}
+
+		void HandlePointerAxis (WaylandMessageReader reader)
+		{
+			uint time = reader.ReadUInt32 ();
+			uint axis = reader.ReadUInt32 ();
+			int value = reader.ReadInt32 ();
+			if (axis != WaylandProtocol.WlPointer.AxisVerticalScroll || value == 0)
+				return;
+
+			WaylandWindow surfaceWindow = pointerWindow;
+			if (surfaceWindow == null)
+				return;
+
+			int targetX;
+			int targetY;
+			WaylandWindow pointerTarget = ResolvePointerTarget (surfaceWindow, pointerSurfacePosition.X, pointerSurfacePosition.Y, out targetX, out targetY);
+			WaylandWindow wheelTarget = null;
+			if (focusWindow != IntPtr.Zero)
+				windows.TryGetValue (focusWindow, out wheelTarget);
+			if (wheelTarget == null)
+				wheelTarget = pointerTarget;
+			if (wheelTarget == null)
+				return;
+
+			if (wheelTarget != pointerTarget) {
+				Point screen = GetWindowScreenLocation (wheelTarget);
+				targetX = mousePosition.X - screen.X;
+				targetY = mousePosition.Y - screen.Y;
+			}
+
+			// Wayland's vertical axis is positive when scrolling down; WinForms
+			// uses the Win32 convention where positive wheel deltas scroll up.
+			int delta = value < 0 ? 120 : -120;
+			PostInputMessage (wheelTarget.Hwnd.Handle, Msg.WM_MOUSEWHEEL, (IntPtr) MakeMouseWParam (delta), Control.MakeParam (targetX, targetY), time);
+		}
+
+		void HandleKeyboardMessage (WaylandMessage message)
+		{
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+
+			switch (message.Opcode) {
+			case WaylandProtocol.WlKeyboard.Keymap:
+				// This intentionally ignores the compositor keymap for now.
+				// wl_keyboard sends XKB keymaps through file descriptors, and a
+				// correct managed implementation needs an XKB parser instead of
+				// libxkbcommon.  Until that exists, key routing is physical
+				// evdev-to-Keys plus US ASCII text for TranslateMessage.
+				return;
+
+			case WaylandProtocol.WlKeyboard.Enter: {
+				lastInputSerial = reader.ReadUInt32 ();
+				uint surfaceId = reader.ReadUInt32 ();
+				if (!reader.End)
+					reader.ReadArray ();
+
+				WaylandWindow window;
+				if (!waylandObjects.TryGetValue (surfaceId, out window))
+					return;
+
+				keyboardWindow = window;
+				ActivateForInput (window);
+				if (focusWindow == IntPtr.Zero || !FocusBelongsToSurfaceTree (window))
+					SetFocusWindow (window.Hwnd.Handle);
+				return;
+			}
+
+			case WaylandProtocol.WlKeyboard.Leave:
+				lastInputSerial = reader.ReadUInt32 ();
+				keyboardWindow = null;
+				SetFocusWindow (IntPtr.Zero);
+				return;
+
+			case WaylandProtocol.WlKeyboard.Key:
+				HandleKeyboardKey (reader);
+				return;
+
+			case WaylandProtocol.WlKeyboard.Modifiers:
+				lastInputSerial = reader.ReadUInt32 ();
+				// The depressed/latched/locked masks are XKB-keymap dependent.
+				// With no managed XKB layer yet, keep modifier state from the
+				// physical key events we route below instead of guessing mask bits.
+				return;
+			}
+		}
+
+		void HandleKeyboardKey (WaylandMessageReader reader)
+		{
+			lastInputSerial = reader.ReadUInt32 ();
+			uint time = reader.ReadUInt32 ();
+			uint evdevKey = reader.ReadUInt32 ();
+			uint state = reader.ReadUInt32 ();
+			bool pressed = state == WaylandProtocol.WlKeyboard.KeyStatePressed;
+			bool wasDown = evdevKeysDown.Contains (evdevKey);
+			Keys oldModifiers = modifierKeys;
+
+			if (pressed)
+				evdevKeysDown.Add (evdevKey);
+			else
+				evdevKeysDown.Remove (evdevKey);
+			UpdateModifierKeys ();
+
+			Keys key = MapEvdevKey (evdevKey);
+			if (key == Keys.None)
+				return;
+
+			IntPtr target = focusWindow;
+			// The compositor gives keyboard focus to a Wayland surface, while
+			// WinForms focus is usually a child HWND selected by mouse/tab
+			// handling.  Prefer Mono's focused control and fall back to the
+			// compositor surface only when Mono has no focused HWND.
+			if (target == IntPtr.Zero && keyboardWindow != null)
+				target = keyboardWindow.Hwnd.Handle;
+			if (target == IntPtr.Zero)
+				target = activeWindow;
+			if (target == IntPtr.Zero)
+				return;
+
+			Keys sysModifiers = pressed ? modifierKeys : oldModifiers;
+			bool sysKey = (sysModifiers & Keys.Alt) != 0 && (sysModifiers & Keys.Control) == 0;
+			Msg message = pressed ? (sysKey ? Msg.WM_SYSKEYDOWN : Msg.WM_KEYDOWN) : (sysKey ? Msg.WM_SYSKEYUP : Msg.WM_KEYUP);
+			IntPtr lParam = MakeKeyLParam (evdevKey, pressed, wasDown, sysKey);
+
+			MSG msg = CreateInputMessage (target, message, (IntPtr) key, lParam, time);
+			char ch;
+			if (pressed && TryGetKeyChar (key, modifierKeys, sysKey, out ch))
+				keyText [GetKeyTextKey (msg)] = ch;
+			EnqueueMessage (msg);
+		}
+
+		void HandlePopupMessage (WaylandWindow window, WaylandMessage message)
+		{
+			if (message.Opcode != WaylandProtocol.XdgPopup.PopupDone)
+				return;
+
+			// xdg_popup.popup_done is the compositor-side result of the popup
+			// grab ending, usually from an outside click or Escape.  Convert that
+			// back to the managed popup controls that know how to restore ComboBox
+			// and ToolStrip state.
+			DismissPopupWindow (window);
 		}
 
 		void HandleOutputMessage (WaylandOutput output, WaylandMessage message)
@@ -1492,14 +1985,19 @@ namespace System.Windows.Forms {
 			foreach (WaylandWindow child in windows.Values) {
 				if (child.Hwnd.Parent == window.Hwnd)
 					UpdateWindowScale (child);
+				else if (IsPopupWindow (child) && GetPopupParentWindow (child) == window)
+					UpdateWindowScale (child);
 			}
 		}
 
 		int GetTargetScale (WaylandWindow window)
 		{
 			WaylandWindow parent = GetParentWindow (window);
-			// Child scale follows the parent so SetPosition and WinForms layout
-			// remain in the same logical coordinate space across all child HWNDs.
+			if (parent == null && IsPopupWindow (window))
+				parent = GetPopupParentWindow (window);
+			// Child and owned popup scale follows the parent so SetPosition,
+			// positioners, and WinForms layout remain in one logical coordinate
+			// space across all related HWND surfaces.
 			if (parent != null)
 				return parent.BufferScale;
 
@@ -1551,6 +2049,419 @@ namespace System.Windows.Forms {
 		bool IsSubsurfaceWindow (WaylandWindow window)
 		{
 			return window.Hwnd.Parent != null || StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_CHILD);
+		}
+
+		bool IsPopupWindow (WaylandWindow window)
+		{
+			return window.Hwnd.owner != null && StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_POPUP);
+		}
+
+		WaylandWindow GetPopupParentWindow (WaylandWindow window)
+		{
+			if (window.Hwnd.owner == null)
+				return null;
+
+			WaylandWindow parent;
+			if (!windows.TryGetValue (window.Hwnd.owner.Handle, out parent))
+				return null;
+
+			return GetRootWindow (parent);
+		}
+
+		WaylandWindow GetRootWindow (WaylandWindow window)
+		{
+			WaylandWindow current = window;
+			while (current != null && current.Hwnd.Parent != null) {
+				WaylandWindow parent;
+				if (!windows.TryGetValue (current.Hwnd.Parent.Handle, out parent))
+					break;
+				current = parent;
+			}
+			return current;
+		}
+
+		Point GetWindowScreenLocation (WaylandWindow window)
+		{
+			int x = window.Hwnd.X;
+			int y = window.Hwnd.Y;
+			Hwnd parent = window.Hwnd.Parent;
+
+			// Child HWND coordinates are parent-relative in Mono.  Wayland
+			// pointer coordinates are surface-local, so every conversion through
+			// Control.MousePosition/PointToClient needs the full logical parent
+			// chain, not only the immediate Hwnd.X/Y.
+			while (parent != null) {
+				x += parent.X;
+				y += parent.Y;
+				parent = parent.Parent;
+			}
+
+			return new Point (x, y);
+		}
+
+		void SetFocusWindow (IntPtr hwnd)
+		{
+			if (hwnd != IntPtr.Zero && !windows.ContainsKey (hwnd))
+				return;
+			if (focusWindow == hwnd)
+				return;
+
+			IntPtr oldFocus = focusWindow;
+			focusWindow = hwnd;
+			if (oldFocus != IntPtr.Zero)
+				PostMessage (oldFocus, Msg.WM_KILLFOCUS, hwnd, IntPtr.Zero);
+			if (hwnd != IntPtr.Zero)
+				PostMessage (hwnd, Msg.WM_SETFOCUS, oldFocus, IntPtr.Zero);
+		}
+
+		void ActivateForInput (WaylandWindow window)
+		{
+			WaylandWindow active = IsPopupWindow (window) ? GetPopupParentWindow (window) : GetRootWindow (window);
+			if (active == null)
+				return;
+
+			IntPtr handle = active.Hwnd.Handle;
+			if (activeWindow == handle)
+				return;
+
+			IntPtr oldActive = activeWindow;
+			activeWindow = handle;
+			if (oldActive != IntPtr.Zero)
+				PostMessage (oldActive, Msg.WM_ACTIVATE, (IntPtr) WindowActiveFlags.WA_INACTIVE, handle);
+			PostMessage (handle, Msg.WM_ACTIVATE, (IntPtr) WindowActiveFlags.WA_ACTIVE, oldActive);
+		}
+
+		bool FocusBelongsToSurfaceTree (WaylandWindow surfaceWindow)
+		{
+			WaylandWindow focused;
+			if (focusWindow == IntPtr.Zero || !windows.TryGetValue (focusWindow, out focused))
+				return false;
+
+			WaylandWindow focusedRoot = IsPopupWindow (focused) ? GetPopupParentWindow (focused) : GetRootWindow (focused);
+			WaylandWindow surfaceRoot = IsPopupWindow (surfaceWindow) ? GetPopupParentWindow (surfaceWindow) : GetRootWindow (surfaceWindow);
+			return focusedRoot != null && focusedRoot == surfaceRoot;
+		}
+
+		void UpdatePointerPosition (WaylandWindow window, int x, int y)
+		{
+			pointerSurfacePosition = new Point (x, y);
+			Point origin = GetWindowScreenLocation (window);
+			mousePosition = new Point (origin.X + x, origin.Y + y);
+		}
+
+		WaylandWindow ResolvePointerTarget (WaylandWindow surfaceWindow, int surfaceX, int surfaceY, out int targetX, out int targetY)
+		{
+			WaylandWindow target = surfaceWindow;
+			targetX = surfaceX;
+			targetY = surfaceY;
+
+			if (grabWindow != IntPtr.Zero) {
+				if (!windows.TryGetValue (grabWindow, out target))
+					return null;
+
+				Point targetScreen = GetWindowScreenLocation (target);
+				targetX = mousePosition.X - targetScreen.X;
+				targetY = mousePosition.Y - targetScreen.Y;
+			}
+
+			return target;
+		}
+
+		void PostPointerMessage (Msg message, WaylandWindow surfaceWindow, int surfaceX, int surfaceY, int wheelDelta, uint time)
+		{
+			int targetX;
+			int targetY;
+			WaylandWindow target = ResolvePointerTarget (surfaceWindow, surfaceX, surfaceY, out targetX, out targetY);
+			if (target == null)
+				return;
+
+			PostInputMessage (target.Hwnd.Handle, message, (IntPtr) MakeMouseWParam (wheelDelta), Control.MakeParam (targetX, targetY), time);
+		}
+
+		bool TryGetMouseMessages (uint button, out MouseButtons managedButton, out Msg down, out Msg up, out Msg dblclk)
+		{
+			switch (button) {
+			case WaylandProtocol.WlPointer.ButtonLeft:
+				managedButton = MouseButtons.Left;
+				down = Msg.WM_LBUTTONDOWN;
+				up = Msg.WM_LBUTTONUP;
+				dblclk = Msg.WM_LBUTTONDBLCLK;
+				return true;
+			case WaylandProtocol.WlPointer.ButtonRight:
+				managedButton = MouseButtons.Right;
+				down = Msg.WM_RBUTTONDOWN;
+				up = Msg.WM_RBUTTONUP;
+				dblclk = Msg.WM_RBUTTONDBLCLK;
+				return true;
+			case WaylandProtocol.WlPointer.ButtonMiddle:
+				managedButton = MouseButtons.Middle;
+				down = Msg.WM_MBUTTONDOWN;
+				up = Msg.WM_MBUTTONUP;
+				dblclk = Msg.WM_MBUTTONDBLCLK;
+				return true;
+			default:
+				managedButton = MouseButtons.None;
+				down = up = dblclk = Msg.WM_NULL;
+				return false;
+			}
+		}
+
+		int MakeMouseWParam (int wheelDelta)
+		{
+			int value = 0;
+			if ((mouseButtons & MouseButtons.Left) != 0)
+				value |= (int) MsgButtons.MK_LBUTTON;
+			if ((mouseButtons & MouseButtons.Right) != 0)
+				value |= (int) MsgButtons.MK_RBUTTON;
+			if ((mouseButtons & MouseButtons.Middle) != 0)
+				value |= (int) MsgButtons.MK_MBUTTON;
+			if ((modifierKeys & Keys.Shift) != 0)
+				value |= (int) MsgButtons.MK_SHIFT;
+			if ((modifierKeys & Keys.Control) != 0)
+				value |= (int) MsgButtons.MK_CONTROL;
+
+			return unchecked (value | (((int) (ushort) wheelDelta) << 16));
+		}
+
+		bool IsDoubleClick (IntPtr handle, Msg message, int x, int y, uint time)
+		{
+			if (lastClickWindow != handle || lastClickMessage != message)
+				return false;
+			if (unchecked (time - lastClickTime) > (uint) DoubleClickTime)
+				return false;
+
+			Size size = DoubleClickSize;
+			return Math.Abs (x - lastClickX) <= size.Width && Math.Abs (y - lastClickY) <= size.Height;
+		}
+
+		void DismissPopupWindow (WaylandWindow window)
+		{
+			Control control = Control.FromHandle (window.Hwnd.Handle);
+			if (control == null) {
+				PostMessage (window.Hwnd.Handle, Msg.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+				return;
+			}
+
+			ToolStripDropDown dropDown = control as ToolStripDropDown;
+			if (dropDown != null) {
+				dropDown.Dismiss (ToolStripDropDownCloseReason.AppClicked);
+				return;
+			}
+
+			System.Reflection.MethodInfo hideWindow = control.GetType ().GetMethod ("HideWindow", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+			if (hideWindow != null) {
+				hideWindow.Invoke (control, null);
+				return;
+			}
+
+			control.Hide ();
+		}
+
+		void PostInputMessage (IntPtr hwnd, Msg message, IntPtr wParam, IntPtr lParam, uint time)
+		{
+			EnqueueMessage (CreateInputMessage (hwnd, message, wParam, lParam, time));
+		}
+
+		MSG CreateInputMessage (IntPtr hwnd, Msg message, IntPtr wParam, IntPtr lParam, uint time)
+		{
+			MSG msg = new MSG ();
+			msg.hwnd = hwnd;
+			msg.message = message;
+			msg.wParam = wParam;
+			msg.lParam = lParam;
+			msg.time = time == 0 ? CurrentMessageTime () : time;
+			return msg;
+		}
+
+		static uint CurrentMessageTime ()
+		{
+			return unchecked ((uint) Environment.TickCount);
+		}
+
+		static int FixedToInt (int value)
+		{
+			return (int) Math.Floor (value / 256.0);
+		}
+
+		static IntPtr MakeKeyLParam (uint evdevKey, bool pressed, bool wasDown, bool sysKey)
+		{
+			int value = 1 | unchecked ((int) ((evdevKey & 0xff) << 16));
+			if (sysKey)
+				value |= 1 << 29;
+			if (wasDown)
+				value |= 1 << 30;
+			if (!pressed)
+				value |= unchecked ((int) 0x80000000);
+			return (IntPtr) value;
+		}
+
+		static string GetKeyTextKey (MSG msg)
+		{
+			return msg.hwnd.ToInt64 ().ToString ("x") + ":" + ((int) msg.message).ToString ("x") + ":" +
+				msg.wParam.ToInt64 ().ToString ("x") + ":" + msg.lParam.ToInt64 ().ToString ("x") + ":" +
+				msg.time.ToString ("x");
+		}
+
+		void UpdateModifierKeys ()
+		{
+			Keys keys = Keys.None;
+			if (evdevKeysDown.Contains (42) || evdevKeysDown.Contains (54))
+				keys |= Keys.Shift;
+			if (evdevKeysDown.Contains (29) || evdevKeysDown.Contains (97))
+				keys |= Keys.Control;
+			if (evdevKeysDown.Contains (56) || evdevKeysDown.Contains (100))
+				keys |= Keys.Alt;
+			modifierKeys = keys;
+		}
+
+		static Keys MapEvdevKey (uint key)
+		{
+			switch (key) {
+			case 1: return Keys.Escape;
+			case 2: return Keys.D1;
+			case 3: return Keys.D2;
+			case 4: return Keys.D3;
+			case 5: return Keys.D4;
+			case 6: return Keys.D5;
+			case 7: return Keys.D6;
+			case 8: return Keys.D7;
+			case 9: return Keys.D8;
+			case 10: return Keys.D9;
+			case 11: return Keys.D0;
+			case 12: return Keys.OemMinus;
+			case 13: return Keys.Oemplus;
+			case 14: return Keys.Back;
+			case 15: return Keys.Tab;
+			case 16: return Keys.Q;
+			case 17: return Keys.W;
+			case 18: return Keys.E;
+			case 19: return Keys.R;
+			case 20: return Keys.T;
+			case 21: return Keys.Y;
+			case 22: return Keys.U;
+			case 23: return Keys.I;
+			case 24: return Keys.O;
+			case 25: return Keys.P;
+			case 26: return Keys.OemOpenBrackets;
+			case 27: return Keys.OemCloseBrackets;
+			case 28: return Keys.Return;
+			case 29: return Keys.ControlKey;
+			case 30: return Keys.A;
+			case 31: return Keys.S;
+			case 32: return Keys.D;
+			case 33: return Keys.F;
+			case 34: return Keys.G;
+			case 35: return Keys.H;
+			case 36: return Keys.J;
+			case 37: return Keys.K;
+			case 38: return Keys.L;
+			case 39: return Keys.OemSemicolon;
+			case 40: return Keys.OemQuotes;
+			case 41: return Keys.Oemtilde;
+			case 42: return Keys.ShiftKey;
+			case 43: return Keys.OemPipe;
+			case 44: return Keys.Z;
+			case 45: return Keys.X;
+			case 46: return Keys.C;
+			case 47: return Keys.V;
+			case 48: return Keys.B;
+			case 49: return Keys.N;
+			case 50: return Keys.M;
+			case 51: return Keys.Oemcomma;
+			case 52: return Keys.OemPeriod;
+			case 53: return Keys.OemQuestion;
+			case 54: return Keys.ShiftKey;
+			case 55: return Keys.Multiply;
+			case 56: return Keys.Menu;
+			case 57: return Keys.Space;
+			case 58: return Keys.CapsLock;
+			case 59: return Keys.F1;
+			case 60: return Keys.F2;
+			case 61: return Keys.F3;
+			case 62: return Keys.F4;
+			case 63: return Keys.F5;
+			case 64: return Keys.F6;
+			case 65: return Keys.F7;
+			case 66: return Keys.F8;
+			case 67: return Keys.F9;
+			case 68: return Keys.F10;
+			case 69: return Keys.NumLock;
+			case 70: return Keys.Scroll;
+			case 71: return Keys.NumPad7;
+			case 72: return Keys.NumPad8;
+			case 73: return Keys.NumPad9;
+			case 74: return Keys.Subtract;
+			case 75: return Keys.NumPad4;
+			case 76: return Keys.NumPad5;
+			case 77: return Keys.NumPad6;
+			case 78: return Keys.Add;
+			case 79: return Keys.NumPad1;
+			case 80: return Keys.NumPad2;
+			case 81: return Keys.NumPad3;
+			case 82: return Keys.NumPad0;
+			case 83: return Keys.Decimal;
+			case 86: return Keys.OemBackslash;
+			case 87: return Keys.F11;
+			case 88: return Keys.F12;
+			case 96: return Keys.Return;
+			case 97: return Keys.ControlKey;
+			case 98: return Keys.Divide;
+			case 100: return Keys.Menu;
+			case 102: return Keys.Home;
+			case 103: return Keys.Up;
+			case 104: return Keys.PageUp;
+			case 105: return Keys.Left;
+			case 106: return Keys.Right;
+			case 107: return Keys.End;
+			case 108: return Keys.Down;
+			case 109: return Keys.PageDown;
+			case 110: return Keys.Insert;
+			case 111: return Keys.Delete;
+			case 125: return Keys.LWin;
+			case 126: return Keys.RWin;
+			default: return Keys.None;
+			}
+		}
+
+		static bool TryGetKeyChar (Keys key, Keys modifiers, bool sysKey, out char ch)
+		{
+			ch = '\0';
+			if ((modifiers & Keys.Control) != 0)
+				return false;
+
+			bool shift = (modifiers & Keys.Shift) != 0;
+			if (key >= Keys.A && key <= Keys.Z) {
+				ch = (char) ((shift ? 'A' : 'a') + ((int) key - (int) Keys.A));
+				return true;
+			}
+
+			if (key >= Keys.D0 && key <= Keys.D9) {
+				string normal = "0123456789";
+				string shifted = ")!@#$%^&*(";
+				int index = (int) key - (int) Keys.D0;
+				ch = shift ? shifted [index] : normal [index];
+				return true;
+			}
+
+			switch (key) {
+			case Keys.Space: ch = ' '; return true;
+			case Keys.Return: ch = '\r'; return true;
+			case Keys.Tab: ch = '\t'; return true;
+			case Keys.Back: ch = '\b'; return true;
+			case Keys.OemMinus: ch = shift ? '_' : '-'; return true;
+			case Keys.Oemplus: ch = shift ? '+' : '='; return true;
+			case Keys.OemOpenBrackets: ch = shift ? '{' : '['; return true;
+			case Keys.OemCloseBrackets: ch = shift ? '}' : ']'; return true;
+			case Keys.OemPipe: ch = shift ? '|' : '\\'; return true;
+			case Keys.OemSemicolon: ch = shift ? ':' : ';'; return true;
+			case Keys.OemQuotes: ch = shift ? '"' : '\''; return true;
+			case Keys.Oemtilde: ch = shift ? '~' : '`'; return true;
+			case Keys.Oemcomma: ch = shift ? '<' : ','; return true;
+			case Keys.OemPeriod: ch = shift ? '>' : '.'; return true;
+			case Keys.OemQuestion: ch = shift ? '?' : '/'; return true;
+			default:
+				return false;
+			}
 		}
 
 		void UpdateSubsurfacePosition (WaylandWindow window)
