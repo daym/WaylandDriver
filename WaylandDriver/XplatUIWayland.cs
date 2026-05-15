@@ -53,6 +53,45 @@ namespace System.Windows.Forms {
 			public int Scale = 1;
 		}
 
+		sealed class WaylandOffscreenDrawable : IDisposable {
+			public readonly IntPtr Handle;
+			public readonly int LogicalWidth;
+			public readonly int LogicalHeight;
+			public Bitmap Bitmap;
+			public int Scale = 1;
+
+			public WaylandOffscreenDrawable (IntPtr handle, int width, int height)
+			{
+				Handle = handle;
+				LogicalWidth = Math.Max (1, width);
+				LogicalHeight = Math.Max (1, height);
+			}
+
+			public void EnsureBitmap (int scale)
+			{
+				scale = Math.Max (1, scale);
+				int width = checked (LogicalWidth * scale);
+				int height = checked (LogicalHeight * scale);
+
+				if (Bitmap != null && Scale == scale && Bitmap.Width == width && Bitmap.Height == height)
+					return;
+
+				if (Bitmap != null)
+					Bitmap.Dispose ();
+
+				Bitmap = new Bitmap (width, height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+				Bitmap.SetResolution (96.0f * scale, 96.0f * scale);
+				Scale = scale;
+			}
+
+			public void Dispose ()
+			{
+				if (Bitmap != null)
+					Bitmap.Dispose ();
+				Bitmap = null;
+			}
+		}
+
 		readonly object queueLock = new object ();
 		readonly Queue messageQueue = new Queue ();
 		readonly Dictionary<IntPtr, WaylandWindow> windows = new Dictionary<IntPtr, WaylandWindow> ();
@@ -564,6 +603,46 @@ namespace System.Windows.Forms {
 			Graphics graphics = Graphics.FromImage (window.BackBuffer);
 			ApplyLogicalScale (graphics, window);
 			return graphics;
+		}
+
+		internal override void CreateOffscreenDrawable (IntPtr handle, int width, int height, out object offscreen_drawable)
+		{
+			WaylandOffscreenDrawable drawable = new WaylandOffscreenDrawable (handle, width, height);
+			drawable.EnsureBitmap (GetTargetScale (handle));
+			offscreen_drawable = drawable;
+		}
+
+		internal override void DestroyOffscreenDrawable (object offscreen_drawable)
+		{
+			WaylandOffscreenDrawable drawable = (WaylandOffscreenDrawable) offscreen_drawable;
+			drawable.Dispose ();
+		}
+
+		internal override Graphics GetOffscreenGraphics (object offscreen_drawable)
+		{
+			WaylandOffscreenDrawable drawable = (WaylandOffscreenDrawable) offscreen_drawable;
+			drawable.EnsureBitmap (GetTargetScale (drawable.Handle));
+			Graphics graphics = Graphics.FromImage (drawable.Bitmap);
+			ApplyLogicalScale (graphics, drawable.Scale);
+			return graphics;
+		}
+
+		internal override void BlitFromOffscreen (IntPtr dest_handle, Graphics dest_dc, object offscreen_drawable, Graphics offscreen_dc, Rectangle r)
+		{
+			WaylandOffscreenDrawable drawable = (WaylandOffscreenDrawable) offscreen_drawable;
+			Rectangle dest = Rectangle.Intersect (r, new Rectangle (0, 0, drawable.LogicalWidth, drawable.LogicalHeight));
+			if (dest.Width <= 0 || dest.Height <= 0)
+				return;
+
+			Rectangle source = new Rectangle (dest.X * drawable.Scale, dest.Y * drawable.Scale, dest.Width * drawable.Scale, dest.Height * drawable.Scale);
+			InterpolationMode oldInterpolation = dest_dc.InterpolationMode;
+
+			try {
+				dest_dc.InterpolationMode = InterpolationMode.NearestNeighbor;
+				dest_dc.DrawImage (drawable.Bitmap, dest, source, GraphicsUnit.Pixel);
+			} finally {
+				dest_dc.InterpolationMode = oldInterpolation;
+			}
 		}
 
 		internal override void SetWindowPos (IntPtr handle, int x, int y, int width, int height)
@@ -1399,6 +1478,12 @@ namespace System.Windows.Forms {
 			return scale;
 		}
 
+		int GetTargetScale (IntPtr handle)
+		{
+			WaylandWindow window;
+			return windows.TryGetValue (handle, out window) ? GetTargetScale (window) : 1;
+		}
+
 		void HandleToplevelConfigure (WaylandWindow window, WaylandMessage message)
 		{
 			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
@@ -1447,14 +1532,19 @@ namespace System.Windows.Forms {
 
 		static void ApplyLogicalScale (Graphics graphics, WaylandWindow window)
 		{
+			ApplyLogicalScale (graphics, window.BufferScale);
+		}
+
+		static void ApplyLogicalScale (Graphics graphics, int scale)
+		{
 			graphics.CompositingQuality = CompositingQuality.HighQuality;
 			graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
 			graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
 			graphics.SmoothingMode = SmoothingMode.AntiAlias;
 			graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
 
-			if (window.BufferScale != 1)
-				graphics.ScaleTransform (window.BufferScale, window.BufferScale);
+			if (scale != 1)
+				graphics.ScaleTransform (scale, scale);
 		}
 
 		void ApplySubsurfaceZOrder (WaylandWindow window, IntPtr afterHWnd, bool top, bool bottom)
