@@ -10,12 +10,14 @@ namespace WaylandDriver.Wayland {
 		readonly Socket socket;
 		readonly object writeLock = new object ();
 		readonly Queue<int> pendingFds = new Queue<int> ();
+		readonly WaylandProtocolTrace trace;
 		uint nextObjectId = 2;
 		bool disposed;
 
 		WaylandConnection (Socket socket)
 		{
 			this.socket = socket;
+			trace = WaylandProtocolTrace.CreateFromEnvironment ();
 		}
 
 		public static WaylandConnection ConnectFromEnvironment ()
@@ -38,6 +40,8 @@ namespace WaylandDriver.Wayland {
 				build (builder);
 
 			byte [] bytes = builder.ToArray (objectId, opcode);
+			if (trace != null)
+				trace.LogOutgoing (bytes, 0);
 			lock (writeLock) {
 				int offset = 0;
 				while (offset < bytes.Length)
@@ -52,6 +56,8 @@ namespace WaylandDriver.Wayland {
 				build (builder);
 
 			byte [] bytes = builder.ToArray (objectId, opcode);
+			if (trace != null)
+				trace.LogOutgoing (bytes, 1);
 			byte [] control = new byte [checked ((int) Syscall.CMSG_SPACE (sizeof (int)))];
 			Msghdr message = new Msghdr {
 				msg_control = control,
@@ -105,6 +111,8 @@ namespace WaylandDriver.Wayland {
 				throw new InvalidDataException ("Invalid Wayland message size.");
 
 			message = new WaylandMessage (objectId, opcode, ReadExactly (size - 8), new int [0]);
+			if (trace != null)
+				trace.LogIncoming (message, pendingFds.Count);
 			return true;
 		}
 
