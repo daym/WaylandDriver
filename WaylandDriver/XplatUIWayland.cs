@@ -620,6 +620,7 @@ namespace System.Windows.Forms {
 				void AddVirtualModifiersFromModifierMapSymbol (Dictionary<string, uint> masks, string symbolName, uint mask)
 				{
 					bool found = false;
+					ParsedKey bestKey = null;
 					uint bestKeycode = UInt32.MaxValue;
 					int bestGroup = Int32.MaxValue;
 					int bestLevel = Int32.MaxValue;
@@ -640,6 +641,7 @@ namespace System.Windows.Forms {
 									continue;
 								if (!found || group < bestGroup || group == bestGroup && (level < bestLevel || level == bestLevel && keycode < bestKeycode)) {
 									found = true;
+									bestKey = key;
 									bestGroup = group;
 									bestLevel = level;
 									bestKeycode = keycode;
@@ -649,7 +651,7 @@ namespace System.Windows.Forms {
 					}
 
 					if (found)
-						AddVirtualModifierFromSymbolName (masks, symbolName, bestGroup, bestLevel, mask);
+						AddVirtualModifiersFromKey (masks, bestKey, mask);
 				}
 
 				void AddVirtualModifiersFromKey (Dictionary<string, uint> masks, ParsedKey key, uint mask)
@@ -1418,7 +1420,11 @@ namespace System.Windows.Forms {
 				void ParseModifierMap ()
 				{
 					Token modifier = lexer.Read ();
-					uint modifierMask = ModifierMaskForName (TokenText (modifier));
+					string modifierName = TokenText (modifier);
+					bool deleteMap = IsNoModifierName (modifierName);
+					uint modifierMask = deleteMap ? 0 : ModifierMaskForName (modifierName);
+					if (!deleteMap && modifierMask == 0)
+						Unsupported ("modifier_map uses non-real modifier " + modifierName);
 					if (!SkipToBlockStart ()) {
 						SkipToStatementEnd ();
 						return;
@@ -1440,7 +1446,7 @@ namespace System.Windows.Forms {
 							continue;
 						}
 
-						if (depth == 1 && modifierMask != 0 && (token.Kind == TokenKind.KeyName || token.Kind == TokenKind.Identifier)) {
+						if (depth == 1 && (token.Kind == TokenKind.KeyName || token.Kind == TokenKind.Identifier)) {
 							ModifierMapMember member = new ModifierMapMember ();
 							member.IsKeyName = token.Kind == TokenKind.KeyName;
 							member.Name = TokenText (token);
@@ -1449,8 +1455,36 @@ namespace System.Windows.Forms {
 					}
 
 					SkipToStatementEnd ();
-					if (entry.Mask != 0 && entry.Members.Count > 0)
-						modifierMaps.Add (entry);
+					if (deleteMap) {
+						for (int i = 0; i < entry.Members.Count; i++)
+							RemoveModifierMapMember (entry.Members [i]);
+					} else if (entry.Mask != 0 && entry.Members.Count > 0)
+						AddModifierMapEntry (entry);
+				}
+
+				void AddModifierMapEntry (ModifierMapEntry entry)
+				{
+					for (int i = 0; i < entry.Members.Count; i++)
+						RemoveModifierMapMember (entry.Members [i]);
+					modifierMaps.Add (entry);
+				}
+
+				void RemoveModifierMapMember (ModifierMapMember member)
+				{
+					for (int i = modifierMaps.Count - 1; i >= 0; i--) {
+						List<ModifierMapMember> members = modifierMaps [i].Members;
+						for (int j = members.Count - 1; j >= 0; j--) {
+							if (ModifierMapMemberEquals (members [j], member))
+								members.RemoveAt (j);
+						}
+						if (members.Count == 0)
+							modifierMaps.RemoveAt (i);
+					}
+				}
+
+				static bool ModifierMapMemberEquals (ModifierMapMember a, ModifierMapMember b)
+				{
+					return a.IsKeyName == b.IsKeyName && a.Name == b.Name;
 				}
 
 				XkbSymbol [] ParseSymbolArray ()
@@ -2272,9 +2306,19 @@ namespace System.Windows.Forms {
 				case "KEYPAD":
 					type.ModifierNames = new string [] { "Shift", "NumLock" };
 					AddTypeMap (type, EmptyStringArray, 0);
+					AddTypeMap (type, new string [] { "NumLock" }, 1);
+					AddTypeMap (type, new string [] { "Shift", "NumLock" }, 0);
+					return type;
+				case "FOUR_LEVEL_KEYPAD":
+					type.ModifierNames = new string [] { "Shift", "NumLock", "LevelThree" };
+					AddTypeMap (type, EmptyStringArray, 0);
 					AddTypeMap (type, new string [] { "Shift" }, 1);
 					AddTypeMap (type, new string [] { "NumLock" }, 1);
 					AddTypeMap (type, new string [] { "Shift", "NumLock" }, 0);
+					AddTypeMap (type, new string [] { "LevelThree" }, 2);
+					AddTypeMap (type, new string [] { "Shift", "LevelThree" }, 3);
+					AddTypeMap (type, new string [] { "NumLock", "LevelThree" }, 3);
+					AddTypeMap (type, new string [] { "Shift", "NumLock", "LevelThree" }, 2);
 					return type;
 				default:
 					return null;
@@ -2387,7 +2431,7 @@ namespace System.Windows.Forms {
 			static bool TryCreateSymbol (string name, out XkbSymbol symbol)
 			{
 				symbol = NoSymbol ();
-				if (String.IsNullOrEmpty (name) || name == "NoSymbol")
+				if (String.IsNullOrEmpty (name) || name == "NoSymbol" || name == "VoidSymbol")
 					return true;
 
 				uint keysym;
