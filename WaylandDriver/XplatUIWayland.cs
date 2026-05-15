@@ -139,20 +139,19 @@ namespace System.Windows.Forms {
 			{
 				byte [] bytes = new byte [checked ((int) size)];
 				try {
-					int offset = 0;
-					fixed (byte* data = bytes) {
-						while (offset < bytes.Length) {
-							long n = Syscall.read (fd, (IntPtr) (data + offset), (ulong) (bytes.Length - offset));
-							if (n < 0)
-								UnixMarshal.ThrowExceptionForLastError ();
-							if (n == 0)
-								break;
-							offset += (int) n;
+					if (bytes.Length > 0) {
+						// wl_keyboard.keymap is specified as a read-only mmap.
+						// This avoids depending on SCM_RIGHTS open-file-description
+						// seek state and matches the protocol's MAP_PRIVATE rule.
+						IntPtr mapping = Syscall.mmap (IntPtr.Zero, (ulong) bytes.Length, MmapProts.PROT_READ, MmapFlags.MAP_PRIVATE, fd, 0);
+						if (mapping == new IntPtr (-1))
+							UnixMarshal.ThrowExceptionForLastError ();
+						try {
+							Marshal.Copy (mapping, bytes, 0, bytes.Length);
+						} finally {
+							Syscall.munmap (mapping, (ulong) bytes.Length);
 						}
 					}
-
-					if (offset != bytes.Length)
-						Array.Resize (ref bytes, offset);
 
 					int textLength = bytes.Length;
 					if (textLength > 0 && bytes [textLength - 1] == 0)
@@ -169,6 +168,8 @@ namespace System.Windows.Forms {
 		struct WaylandKeyResult {
 			public Keys KeyCode;
 			public string Text;
+			public Keys ShortcutModifiers;
+			public bool HasShortcutModifiers;
 		}
 
 		interface IWaylandKeyboardLayout : IDisposable {
@@ -176,6 +177,76 @@ namespace System.Windows.Forms {
 			void SetModifiers (uint depressed, uint latched, uint locked, uint group);
 			WaylandKeyResult TranslateKey (uint evdevKey, bool pressed);
 		}
+
+		const uint EvdevKeyLeftShift = 42;
+		const uint EvdevKeyRightShift = 54;
+		const uint EvdevKeyLeftControl = 29;
+		const uint EvdevKeyRightControl = 97;
+		const uint EvdevKeyLeftAlt = 56;
+		const uint EvdevKeyRightAlt = 100;
+		const uint XkbKeycodeOffset = 8;
+		const uint XkbModifierShiftMask = 1u << 0;
+		const uint XkbModifierLockMask = 1u << 1;
+		const uint XkbModifierControlMask = 1u << 2;
+		const uint XkbModifierMod1Mask = 1u << 3;
+		const uint XkbModifierMod2Mask = 1u << 4;
+		const uint XkbModifierMod3Mask = 1u << 5;
+		const uint XkbModifierMod4Mask = 1u << 6;
+		const uint XkbModifierMod5Mask = 1u << 7;
+		const uint UnicodeMaxCodePoint = 0x10ffff;
+		const uint XkbKeysymUnicodePrefix = 0x01000000;
+		const uint XkbKeysymUnicodePrefixMask = 0xff000000;
+		const uint XkbKeysymUnicodeCodepointMask = 0x00ffffff;
+		const uint XkbKeysymIsoSpecialStart = 0xfe00;
+		const uint XkbKeysymSpecialStart = 0xff00;
+		const uint XkbKeysymSpecialEnd = 0xffff;
+		const uint XkbKeysymBackSpace = 0xff08;
+		const uint XkbKeysymTab = 0xff09;
+		const uint XkbKeysymReturn = 0xff0d;
+		const uint XkbKeysymPause = 0xff13;
+		const uint XkbKeysymScrollLock = 0xff14;
+		const uint XkbKeysymEscape = 0xff1b;
+		const uint XkbKeysymHome = 0xff50;
+		const uint XkbKeysymLeft = 0xff51;
+		const uint XkbKeysymUp = 0xff52;
+		const uint XkbKeysymRight = 0xff53;
+		const uint XkbKeysymDown = 0xff54;
+		const uint XkbKeysymPageUp = 0xff55;
+		const uint XkbKeysymPageDown = 0xff56;
+		const uint XkbKeysymEnd = 0xff57;
+		const uint XkbKeysymPrint = 0xff61;
+		const uint XkbKeysymInsert = 0xff63;
+		const uint XkbKeysymMenu = 0xff67;
+		const uint XkbKeysymHelp = 0xff6a;
+		const uint XkbKeysymBreak = 0xff6b;
+		const uint XkbKeysymModeSwitch = 0xff7e;
+		const uint XkbKeysymNumLock = 0xff7f;
+		const uint XkbKeysymKpEnter = 0xff8d;
+		const uint XkbKeysymKpMultiply = 0xffaa;
+		const uint XkbKeysymKpAdd = 0xffab;
+		const uint XkbKeysymKpSeparator = 0xffac;
+		const uint XkbKeysymKpSubtract = 0xffad;
+		const uint XkbKeysymKpDecimal = 0xffae;
+		const uint XkbKeysymKpDivide = 0xffaf;
+		const uint XkbKeysymKp0 = 0xffb0;
+		const uint XkbKeysymKp9 = 0xffb9;
+		const uint XkbKeysymF1 = 0xffbe;
+		const uint XkbKeysymF12 = 0xffc9;
+		const uint XkbKeysymShiftL = 0xffe1;
+		const uint XkbKeysymShiftR = 0xffe2;
+		const uint XkbKeysymControlL = 0xffe3;
+		const uint XkbKeysymControlR = 0xffe4;
+		const uint XkbKeysymCapsLock = 0xffe5;
+		const uint XkbKeysymMetaL = 0xffe7;
+		const uint XkbKeysymMetaR = 0xffe8;
+		const uint XkbKeysymAltL = 0xffe9;
+		const uint XkbKeysymAltR = 0xffea;
+		const uint XkbKeysymSuperL = 0xffeb;
+		const uint XkbKeysymSuperR = 0xffec;
+		const uint XkbKeysymHyperL = 0xffed;
+		const uint XkbKeysymHyperR = 0xffee;
+		const uint XkbKeysymDelete = 0xffff;
+		const uint XkbKeysymIsoLevel3Shift = 0xfe03;
 
 		sealed class PhysicalUsKeyboardLayout : IWaylandKeyboardLayout {
 			readonly HashSet<uint> keysDown = new HashSet<uint> ();
@@ -202,6 +273,8 @@ namespace System.Windows.Forms {
 				Keys key = MapEvdevKey (evdevKey);
 				WaylandKeyResult result = new WaylandKeyResult ();
 				result.KeyCode = key;
+				result.ShortcutModifiers = modifierKeys;
+				result.HasShortcutModifiers = true;
 				char ch;
 				if (pressed && TryGetKeyChar (key, modifierKeys, false, out ch))
 					result.Text = new string (ch, 1);
@@ -215,38 +288,1753 @@ namespace System.Windows.Forms {
 			void UpdateModifierKeys ()
 			{
 				Keys keys = Keys.None;
-				if (keysDown.Contains (42) || keysDown.Contains (54))
+				if (keysDown.Contains (EvdevKeyLeftShift) || keysDown.Contains (EvdevKeyRightShift))
 					keys |= Keys.Shift;
-				if (keysDown.Contains (29) || keysDown.Contains (97))
+				if (keysDown.Contains (EvdevKeyLeftControl) || keysDown.Contains (EvdevKeyRightControl))
 					keys |= Keys.Control;
-				if (keysDown.Contains (56) || keysDown.Contains (100))
+				// KEY_RIGHTALT is commonly AltGr/ISO_Level3_Shift on Wayland
+				// layouts.  The physical fallback has no XKB type/action state,
+				// so only KEY_LEFTALT is allowed to enter WinForms' system-Alt
+				// path; otherwise an AltGr press/release can activate menu-mode
+				// semantics and consume later printable input.
+				if (keysDown.Contains (EvdevKeyLeftAlt))
 					keys |= Keys.Alt;
 				modifierKeys = keys;
 			}
 		}
 
 		sealed class ManagedXkbKeyboardLayout : IWaylandKeyboardLayout {
+			sealed class Key {
+				public string Name;
+				public KeyGroup [] Groups;
+			}
+
+			sealed class KeyGroup {
+				public XkbSymbol [] Symbols;
+				public XkbResolvedType Type;
+			}
+
+			sealed class ParsedKey {
+				public XkbSymbol [][] Groups;
+				public string [] TypeNames;
+			}
+
+			struct XkbSymbol {
+				public uint Keysym;
+				public string Name;
+				public string Text;
+				public bool NoSymbol;
+			}
+
+			sealed class XkbType {
+				public string Name;
+				public string [] ModifierNames = EmptyStringArray;
+				public readonly List<XkbTypeMap> Maps = new List<XkbTypeMap> ();
+				public readonly List<XkbTypePreserve> Preserves = new List<XkbTypePreserve> ();
+			}
+
+			struct XkbTypeMap {
+				public string [] ModifierNames;
+				public int Level;
+			}
+
+			struct XkbTypePreserve {
+				public string [] ModifierNames;
+				public string [] PreserveNames;
+			}
+
+			sealed class XkbResolvedType {
+				public string Name;
+				public uint ModifierMask;
+				public readonly Dictionary<uint, int> Levels = new Dictionary<uint, int> ();
+				public readonly Dictionary<uint, uint> Preserves = new Dictionary<uint, uint> ();
+			}
+
+			struct ModifierMapMember {
+				public bool IsKeyName;
+				public string Name;
+			}
+
+			sealed class ModifierMapEntry {
+				public uint Mask;
+				public readonly List<ModifierMapMember> Members = new List<ModifierMapMember> ();
+			}
+
+			enum TokenKind {
+				End,
+				Identifier,
+				Number,
+				String,
+				KeyName,
+				Symbol
+			}
+
+			struct Token {
+				public TokenKind Kind;
+				public string Text;
+				public uint Number;
+				public char Symbol;
+			}
+
+			sealed class Parser {
+				readonly XkbLexer lexer;
+				readonly Dictionary<string, uint> keycodes = new Dictionary<string, uint> (StringComparer.Ordinal);
+				readonly Dictionary<string, ParsedKey> symbols = new Dictionary<string, ParsedKey> (StringComparer.Ordinal);
+				readonly Dictionary<string, XkbType> types = new Dictionary<string, XkbType> (StringComparer.Ordinal);
+				readonly Dictionary<string, string> compatVirtualModifiers = new Dictionary<string, string> (StringComparer.Ordinal);
+				readonly List<ModifierMapEntry> modifierMaps = new List<ModifierMapEntry> ();
+				readonly string [] defaultSymbolTypeNames = new string [4];
+
+				public Parser (string text)
+				{
+					lexer = new XkbLexer (text);
+				}
+
+				public bool TryParse (out Dictionary<uint, Key> keys, out string diagnostic)
+				{
+					keys = new Dictionary<uint, Key> ();
+					diagnostic = null;
+
+					try {
+						while (!lexer.PeekIs (TokenKind.End)) {
+							if (lexer.ReadIfIdentifier ("xkb_keycodes")) {
+								ParseKeycodes ();
+								continue;
+							}
+
+							if (lexer.ReadIfIdentifier ("xkb_types")) {
+								ParseTypes ();
+								continue;
+							}
+
+							if (lexer.ReadIfIdentifier ("xkb_compatibility")) {
+								ParseCompatibility ();
+								continue;
+							}
+
+							if (lexer.ReadIfIdentifier ("xkb_symbols")) {
+								ParseSymbols ();
+								continue;
+							}
+
+							lexer.Read ();
+						}
+					} catch (InvalidOperationException e) {
+						diagnostic = e.Message;
+						return false;
+					}
+
+					if (!BuildKeys (out keys, out diagnostic))
+						return false;
+
+					if (keys.Count == 0) {
+						diagnostic = "managed XKB parser found no key symbols";
+						return false;
+					}
+
+					return true;
+				}
+
+				bool BuildKeys (out Dictionary<uint, Key> keys, out string diagnostic)
+				{
+					keys = new Dictionary<uint, Key> ();
+					diagnostic = null;
+					Dictionary<string, uint> virtualModifierMasks = ResolveVirtualModifierMasks ();
+					Dictionary<string, XkbResolvedType> resolvedTypes = new Dictionary<string, XkbResolvedType> (StringComparer.Ordinal);
+
+					foreach (KeyValuePair<string, ParsedKey> item in symbols) {
+						uint keycode;
+						if (!keycodes.TryGetValue (item.Key, out keycode))
+							continue;
+
+						ParsedKey parsed = item.Value;
+						KeyGroup [] groups = new KeyGroup [parsed.Groups.Length];
+						for (int group = 0; group < parsed.Groups.Length; group++) {
+							XkbSymbol [] groupSymbols = parsed.Groups [group];
+							if (groupSymbols == null)
+								continue;
+
+							string typeName;
+							if (!TryGetGroupTypeName (item.Key, parsed, group, groupSymbols, out typeName, out diagnostic))
+								return false;
+
+							XkbResolvedType type;
+							if (!ResolveType (typeName, virtualModifierMasks, resolvedTypes, out type, out diagnostic))
+								return false;
+
+							KeyGroup keyGroup = new KeyGroup ();
+							keyGroup.Symbols = groupSymbols;
+							keyGroup.Type = type;
+							groups [group] = keyGroup;
+						}
+
+						Key key = new Key ();
+						key.Name = item.Key;
+						key.Groups = groups;
+						keys [keycode] = key;
+					}
+
+					return true;
+				}
+
+				bool TryGetGroupTypeName (string keyName, ParsedKey key, int group, XkbSymbol [] groupSymbols, out string typeName, out string diagnostic)
+				{
+					diagnostic = null;
+					typeName = null;
+					if (key.TypeNames != null && group < key.TypeNames.Length)
+						typeName = key.TypeNames [group];
+					if (!String.IsNullOrEmpty (typeName))
+						return true;
+
+					// XKB keymaps often omit per-key types.  The text format
+					// defines the replacement: use key.type defaults first, then
+					// infer one of the standard key types from the symbols.
+					typeName = InferTypeName (groupSymbols);
+					return true;
+				}
+
+				bool ResolveType (string name, Dictionary<string, uint> virtualModifierMasks, Dictionary<string, XkbResolvedType> resolvedTypes, out XkbResolvedType resolved, out string diagnostic)
+				{
+					diagnostic = null;
+					if (resolvedTypes.TryGetValue (name, out resolved))
+						return true;
+
+					XkbType type;
+					if (!types.TryGetValue (name, out type)) {
+						if (name == "ONE_LEVEL") {
+							resolved = new XkbResolvedType ();
+							resolved.Name = name;
+							resolvedTypes [name] = resolved;
+							return true;
+						}
+
+						diagnostic = "referenced XKB type \"" + name + "\" was not found";
+						return false;
+					}
+
+					uint modifierMask;
+					if (!ResolveModifierNames (type.ModifierNames, virtualModifierMasks, out modifierMask, out diagnostic)) {
+						diagnostic = "type \"" + name + "\": " + diagnostic;
+						resolved = null;
+						return false;
+					}
+
+					resolved = new XkbResolvedType ();
+					resolved.Name = name;
+					resolved.ModifierMask = modifierMask;
+
+					foreach (XkbTypeMap map in type.Maps) {
+						uint selectorMask;
+						if (!ResolveModifierNames (map.ModifierNames, virtualModifierMasks, out selectorMask, out diagnostic)) {
+							diagnostic = "type \"" + name + "\" map: " + diagnostic;
+							resolved = null;
+							return false;
+						}
+						if ((selectorMask & ~modifierMask) != 0) {
+							diagnostic = "type \"" + name + "\" map references modifiers outside its modifier set";
+							resolved = null;
+							return false;
+						}
+						resolved.Levels [selectorMask] = map.Level;
+					}
+
+					foreach (XkbTypePreserve preserve in type.Preserves) {
+						uint selectorMask;
+						uint preserveMask;
+						if (!ResolveModifierNames (preserve.ModifierNames, virtualModifierMasks, out selectorMask, out diagnostic)) {
+							diagnostic = "type \"" + name + "\" preserve selector: " + diagnostic;
+							resolved = null;
+							return false;
+						}
+						if (!ResolveModifierNames (preserve.PreserveNames, virtualModifierMasks, out preserveMask, out diagnostic)) {
+							diagnostic = "type \"" + name + "\" preserve value: " + diagnostic;
+							resolved = null;
+							return false;
+						}
+						resolved.Preserves [selectorMask & modifierMask] = preserveMask & modifierMask;
+					}
+
+					resolvedTypes [name] = resolved;
+					return true;
+				}
+
+				Dictionary<string, uint> ResolveVirtualModifierMasks ()
+				{
+					Dictionary<string, uint> masks = new Dictionary<string, uint> (StringComparer.Ordinal);
+					foreach (ModifierMapEntry map in modifierMaps) {
+						foreach (ModifierMapMember member in map.Members) {
+							if (member.IsKeyName) {
+								ParsedKey key;
+								if (symbols.TryGetValue (member.Name, out key))
+									AddVirtualModifiersFromKey (masks, key, map.Mask);
+							} else
+								AddVirtualModifierFromSymbolName (masks, member.Name, map.Mask);
+						}
+					}
+					return masks;
+				}
+
+				void AddVirtualModifiersFromKey (Dictionary<string, uint> masks, ParsedKey key, uint mask)
+				{
+					if (key.Groups == null)
+						return;
+					for (int group = 0; group < key.Groups.Length; group++) {
+						XkbSymbol [] symbols = key.Groups [group];
+						if (symbols == null)
+							continue;
+						for (int level = 0; level < symbols.Length; level++) {
+							if (!symbols [level].NoSymbol)
+								AddVirtualModifierFromSymbolName (masks, symbols [level].Name, mask);
+						}
+					}
+				}
+
+				void AddVirtualModifierFromSymbolName (Dictionary<string, uint> masks, string symbolName, uint mask)
+				{
+					if (String.IsNullOrEmpty (symbolName))
+						return;
+
+					string virtualModifier;
+					if (compatVirtualModifiers.TryGetValue (symbolName, out virtualModifier))
+						AddVirtualModifierMask (masks, virtualModifier, mask);
+				}
+
+				static void AddVirtualModifierMask (Dictionary<string, uint> masks, string name, uint mask)
+				{
+					uint oldMask;
+					if (masks.TryGetValue (name, out oldMask))
+						masks [name] = oldMask | mask;
+					else
+						masks [name] = mask;
+				}
+
+				static bool ResolveModifierNames (string [] names, Dictionary<string, uint> virtualModifierMasks, out uint mask, out string diagnostic)
+				{
+					mask = 0;
+					diagnostic = null;
+					if (names == null)
+						return true;
+
+					for (int i = 0; i < names.Length; i++) {
+						string name = names [i];
+						if (String.IsNullOrEmpty (name) || IsNoModifierName (name))
+							continue;
+
+						if (IsUnsupportedModifierWildcard (name)) {
+							diagnostic = "unsupported modifier wildcard " + name;
+							return false;
+						}
+
+						uint namedMask = ModifierMaskForName (name);
+						if (namedMask == 0 && !virtualModifierMasks.TryGetValue (name, out namedMask)) {
+							diagnostic = "unresolved modifier " + name;
+							return false;
+						}
+						mask |= namedMask;
+					}
+
+					return true;
+				}
+
+				void ParseKeycodes ()
+				{
+					if (!SkipToBlockStart ())
+						throw new InvalidOperationException ("xkb_keycodes has no block");
+
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated xkb_keycodes block");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{')
+								depth++;
+							else if (token.Symbol == '}')
+								depth--;
+							continue;
+						}
+
+						if (depth != 1)
+							continue;
+
+						if (token.Kind == TokenKind.KeyName) {
+							string keyName = token.Text;
+							if (!lexer.ReadIfSymbol ('='))
+								continue;
+							Token number = lexer.Read ();
+							if (number.Kind == TokenKind.Number)
+								keycodes [keyName] = number.Number;
+							SkipToStatementEnd ();
+							continue;
+						}
+
+						if (token.Kind == TokenKind.Identifier && token.Text == "alias") {
+							Token alias = lexer.Read ();
+							if (alias.Kind == TokenKind.KeyName && lexer.ReadIfSymbol ('=')) {
+								Token target = lexer.Read ();
+								uint targetCode;
+								if (target.Kind == TokenKind.KeyName && keycodes.TryGetValue (target.Text, out targetCode))
+									keycodes [alias.Text] = targetCode;
+							}
+							SkipToStatementEnd ();
+						}
+					}
+				}
+
+				void ParseTypes ()
+				{
+					if (!SkipToBlockStart ())
+						throw new InvalidOperationException ("xkb_types has no block");
+
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated xkb_types block");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{')
+								depth++;
+							else if (token.Symbol == '}')
+								depth--;
+							continue;
+						}
+
+						if (depth != 1 || token.Kind != TokenKind.Identifier)
+							continue;
+
+						if (token.Text == "type")
+							ParseTypeStatement ();
+						else
+							SkipPropertyTail ();
+					}
+				}
+
+				void ParseTypeStatement ()
+				{
+					Token nameToken = lexer.Read ();
+					if (nameToken.Kind != TokenKind.String && nameToken.Kind != TokenKind.Identifier) {
+						SkipStatementOrBlock ();
+						return;
+					}
+
+					if (!SkipToBlockStart ()) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					XkbType type = new XkbType ();
+					type.Name = TokenText (nameToken);
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated type \"" + type.Name + "\" block");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{')
+								depth++;
+							else if (token.Symbol == '}')
+								depth--;
+							continue;
+						}
+
+						if (depth != 1 || token.Kind != TokenKind.Identifier)
+							continue;
+
+						if (token.Text == "modifiers") {
+							if (lexer.ReadIfSymbol ('='))
+								type.ModifierNames = ParseModifierNameListUntil (';');
+							else
+								SkipToStatementEnd ();
+						} else if (token.Text == "map") {
+							ParseTypeMap (type);
+						} else if (token.Text == "preserve") {
+							ParseTypePreserve (type);
+						} else
+							SkipPropertyTail ();
+					}
+
+					SkipToStatementEnd ();
+					types [type.Name] = type;
+				}
+
+				void ParseTypeMap (XkbType type)
+				{
+					if (!lexer.ReadIfSymbol ('[')) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					string [] names = ParseModifierNameListUntil (']');
+					if (!lexer.ReadIfSymbol ('=')) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					Token levelToken = lexer.Read ();
+					int level;
+					if (TryParseLevel (levelToken, out level)) {
+						XkbTypeMap map = new XkbTypeMap ();
+						map.ModifierNames = names;
+						map.Level = level;
+						type.Maps.Add (map);
+					}
+					SkipToStatementEnd ();
+				}
+
+				void ParseTypePreserve (XkbType type)
+				{
+					if (!lexer.ReadIfSymbol ('[')) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					string [] selectorNames = ParseModifierNameListUntil (']');
+					if (!lexer.ReadIfSymbol ('=')) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					XkbTypePreserve preserve = new XkbTypePreserve ();
+					preserve.ModifierNames = selectorNames;
+					preserve.PreserveNames = ParseModifierNameListUntil (';');
+					type.Preserves.Add (preserve);
+				}
+
+				void ParseCompatibility ()
+				{
+					if (!SkipToBlockStart ())
+						throw new InvalidOperationException ("xkb_compatibility has no block");
+
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated xkb_compatibility block");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{')
+								depth++;
+							else if (token.Symbol == '}')
+								depth--;
+							continue;
+						}
+
+						if (depth != 1 || token.Kind != TokenKind.Identifier)
+							continue;
+
+						if (token.Text == "interpret" && !lexer.PeekIsSymbol ('.'))
+							ParseInterpret ();
+						else
+							SkipPropertyTail ();
+					}
+				}
+
+				void ParseInterpret ()
+				{
+					Token symbolToken = lexer.Read ();
+					string symbolName = TokenText (symbolToken);
+					if (String.IsNullOrEmpty (symbolName)) {
+						SkipStatementOrBlock ();
+						return;
+					}
+
+					if (!SkipToBlockStart ()) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated interpret " + symbolName + " block");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{')
+								depth++;
+							else if (token.Symbol == '}')
+								depth--;
+							continue;
+						}
+
+						if (depth != 1 || token.Kind != TokenKind.Identifier)
+							continue;
+
+						if (token.Text == "virtualModifier") {
+							if (lexer.ReadIfSymbol ('=')) {
+								Token value = lexer.Read ();
+								if (value.Kind == TokenKind.Identifier)
+									compatVirtualModifiers [symbolName] = value.Text;
+							}
+							SkipToStatementEnd ();
+						} else
+							SkipPropertyTail ();
+					}
+
+					SkipToStatementEnd ();
+				}
+
+				void ParseSymbols ()
+				{
+					if (!SkipToBlockStart ())
+						throw new InvalidOperationException ("xkb_symbols has no block");
+
+					int depth = 1;
+					string [] savedDefaultTypeNames = (string []) defaultSymbolTypeNames.Clone ();
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated xkb_symbols block");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{')
+								depth++;
+							else if (token.Symbol == '}')
+								depth--;
+							continue;
+						}
+
+						if (depth != 1 || token.Kind != TokenKind.Identifier)
+							continue;
+
+						if (token.Text == "key") {
+							if (lexer.PeekIsSymbol ('.'))
+								ParseKeyDefaultStatement ();
+							else
+								ParseKeyStatement ();
+						}
+						else if (token.Text == "type")
+							ParseDefaultTypeStatement ();
+						else if (token.Text == "modifier_map")
+							ParseModifierMap ();
+						else
+							SkipPropertyTail ();
+					}
+					Array.Copy (savedDefaultTypeNames, defaultSymbolTypeNames, defaultSymbolTypeNames.Length);
+				}
+
+				void ParseKeyDefaultStatement ()
+				{
+					if (!lexer.ReadIfSymbol ('.')) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					Token property = lexer.Read ();
+					if (property.Kind != TokenKind.Identifier || property.Text != "type") {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					ParseDefaultTypeStatement ();
+				}
+
+				void ParseDefaultTypeStatement ()
+				{
+					int group = 0;
+					if (lexer.ReadIfSymbol ('['))
+						group = ParseGroupSelector ();
+					if (!lexer.ReadIfSymbol ('=')) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					Token typeToken = lexer.Read ();
+					if (group >= 0 && group < defaultSymbolTypeNames.Length && (typeToken.Kind == TokenKind.String || typeToken.Kind == TokenKind.Identifier))
+						defaultSymbolTypeNames [group] = TokenText (typeToken);
+					SkipToStatementEnd ();
+				}
+
+				void ParseKeyStatement ()
+				{
+					Token nameToken = lexer.Read ();
+					if (nameToken.Kind != TokenKind.KeyName) {
+						SkipStatementOrBlock ();
+						return;
+					}
+
+					if (!SkipToBlockStart ()) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					Dictionary<int, XkbSymbol []> groups = new Dictionary<int, XkbSymbol []> ();
+					Dictionary<int, string> typeNames = new Dictionary<int, string> ();
+					int nextGroup = 0;
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated key <" + nameToken.Text + "> block");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{')
+								depth++;
+							else if (token.Symbol == '}')
+								depth--;
+							else if (depth == 1 && token.Symbol == '[')
+								groups [nextGroup++] = ParseSymbolArray ();
+							continue;
+						}
+
+						if (depth != 1 || token.Kind != TokenKind.Identifier) {
+							if (depth == 1)
+								SkipToStatementEnd ();
+							continue;
+						}
+
+						if (token.Text == "symbols") {
+							int group = -1;
+							if (lexer.ReadIfSymbol ('['))
+								group = ParseGroupSelector ();
+							if (!lexer.ReadIfSymbol ('=') || !lexer.ReadIfSymbol ('[')) {
+								SkipKeyFieldEnd ();
+								continue;
+							}
+							if (group < 0)
+								group = nextGroup++;
+							groups [group] = ParseSymbolArray ();
+						} else if (token.Text == "type") {
+							int group = 0;
+							if (lexer.ReadIfSymbol ('['))
+								group = ParseGroupSelector ();
+							if (!lexer.ReadIfSymbol ('=')) {
+								SkipKeyFieldEnd ();
+								continue;
+							}
+							Token typeToken = lexer.Read ();
+							if (typeToken.Kind == TokenKind.String || typeToken.Kind == TokenKind.Identifier)
+								typeNames [group] = TokenText (typeToken);
+							SkipKeyFieldEnd ();
+						} else
+							SkipKeyPropertyTail ();
+					}
+
+					SkipToStatementEnd ();
+					if (groups.Count == 0)
+						return;
+
+					int maxGroup = -1;
+					foreach (int group in groups.Keys) {
+						if (group > maxGroup)
+							maxGroup = group;
+					}
+					foreach (int group in typeNames.Keys) {
+						if (group > maxGroup)
+							maxGroup = group;
+					}
+
+					ParsedKey key = new ParsedKey ();
+					key.Groups = new XkbSymbol [maxGroup + 1][];
+					key.TypeNames = new string [maxGroup + 1];
+					foreach (KeyValuePair<int, XkbSymbol []> group in groups)
+						key.Groups [group.Key] = group.Value;
+					for (int group = 0; group < key.TypeNames.Length && group < defaultSymbolTypeNames.Length; group++)
+						key.TypeNames [group] = defaultSymbolTypeNames [group];
+					foreach (KeyValuePair<int, string> typeName in typeNames)
+						key.TypeNames [typeName.Key] = typeName.Value;
+					symbols [nameToken.Text] = key;
+				}
+
+				void ParseModifierMap ()
+				{
+					Token modifier = lexer.Read ();
+					uint modifierMask = ModifierMaskForName (TokenText (modifier));
+					if (!SkipToBlockStart ()) {
+						SkipToStatementEnd ();
+						return;
+					}
+
+					ModifierMapEntry entry = new ModifierMapEntry ();
+					entry.Mask = modifierMask;
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated modifier_map block");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{')
+								depth++;
+							else if (token.Symbol == '}')
+								depth--;
+							continue;
+						}
+
+						if (depth == 1 && modifierMask != 0 && (token.Kind == TokenKind.KeyName || token.Kind == TokenKind.Identifier)) {
+							ModifierMapMember member = new ModifierMapMember ();
+							member.IsKeyName = token.Kind == TokenKind.KeyName;
+							member.Name = TokenText (token);
+							entry.Members.Add (member);
+						}
+					}
+
+					SkipToStatementEnd ();
+					if (entry.Mask != 0 && entry.Members.Count > 0)
+						modifierMaps.Add (entry);
+				}
+
+				XkbSymbol [] ParseSymbolArray ()
+				{
+					List<XkbSymbol> list = new List<XkbSymbol> ();
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated XKB symbols array");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '[')
+								depth++;
+							else if (token.Symbol == ']')
+								depth--;
+							continue;
+						}
+
+						if (depth == 1) {
+							XkbSymbol symbol;
+							if (TryCreateSymbol (TokenText (token), out symbol))
+								list.Add (symbol);
+							else if (token.Kind == TokenKind.Identifier || token.Kind == TokenKind.Number || token.Kind == TokenKind.String)
+								list.Add (NoSymbol ());
+						}
+					}
+
+					return list.ToArray ();
+				}
+
+				string [] ParseModifierNameListUntil (char terminator)
+				{
+					List<string> names = new List<string> ();
+					int depth = 0;
+					while (true) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated XKB modifier expression");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (depth == 0 && token.Symbol == terminator)
+								break;
+							if (token.Symbol == '(' || token.Symbol == '[' || token.Symbol == '{')
+								depth++;
+							else if ((token.Symbol == ')' || token.Symbol == ']' || token.Symbol == '}') && depth > 0)
+								depth--;
+							continue;
+						}
+
+						if (depth == 0 && token.Kind == TokenKind.Identifier) {
+							string name = token.Text;
+							if (!IsNoModifierName (name))
+								names.Add (name);
+						}
+					}
+
+					return names.Count == 0 ? EmptyStringArray : names.ToArray ();
+				}
+
+				void SkipPropertyTail ()
+				{
+					if (lexer.ReadIfSymbol ('['))
+						SkipBalanced (']');
+					if (lexer.ReadIfSymbol ('='))
+						SkipToStatementEnd ();
+					else
+						SkipStatementOrBlock ();
+				}
+
+				void SkipKeyPropertyTail ()
+				{
+					if (lexer.ReadIfSymbol ('['))
+						SkipBalanced (']');
+					if (lexer.ReadIfSymbol ('='))
+						SkipKeyFieldEnd ();
+					else
+						SkipKeyFieldEnd ();
+				}
+
+				void SkipKeyFieldEnd ()
+				{
+					int depth = 0;
+					while (true) {
+						Token token = lexer.Peek ();
+						if (token.Kind == TokenKind.End)
+							return;
+						if (depth == 0 && token.Kind == TokenKind.Symbol && token.Symbol == ',') {
+							lexer.Read ();
+							return;
+						}
+						if (depth == 0 && token.Kind == TokenKind.Symbol && token.Symbol == '}')
+							return;
+						token = lexer.Read ();
+						if (token.Kind != TokenKind.Symbol)
+							continue;
+						if (token.Symbol == '{' || token.Symbol == '[' || token.Symbol == '(')
+							depth++;
+						else if ((token.Symbol == '}' || token.Symbol == ']' || token.Symbol == ')') && depth > 0)
+							depth--;
+					}
+				}
+
+				void SkipBalanced (char close)
+				{
+					char open = close == ']' ? '[' : close == ')' ? '(' : '{';
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated XKB property");
+						if (token.Kind != TokenKind.Symbol)
+							continue;
+						if (token.Symbol == open)
+							depth++;
+						else if (token.Symbol == close)
+							depth--;
+					}
+				}
+
+				int ParseGroupSelector ()
+				{
+					int group = -1;
+					while (true) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated XKB group selector");
+						if (token.Kind == TokenKind.Symbol && token.Symbol == ']')
+							break;
+
+						if (token.Kind == TokenKind.Identifier) {
+							string text = token.Text;
+							if (text.StartsWith ("Group", StringComparison.Ordinal) || text.StartsWith ("group", StringComparison.Ordinal)) {
+								int value;
+								if (Int32.TryParse (text.Substring (5), out value) && value > 0)
+									group = value - 1;
+							}
+						} else if (token.Kind == TokenKind.Number && token.Number > 0)
+							group = checked ((int) token.Number - 1);
+					}
+
+					return group;
+				}
+
+				bool SkipToBlockStart ()
+				{
+					while (true) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							return false;
+						if (token.Kind == TokenKind.Symbol && token.Symbol == '{')
+							return true;
+						if (token.Kind == TokenKind.Symbol && token.Symbol == ';')
+							return false;
+					}
+				}
+
+				void SkipToStatementEnd ()
+				{
+					int depth = 0;
+					while (true) {
+						Token token = lexer.Peek ();
+						if (token.Kind == TokenKind.End)
+							return;
+						if (depth == 0 && token.Kind == TokenKind.Symbol && token.Symbol == ';') {
+							lexer.Read ();
+							return;
+						}
+						token = lexer.Read ();
+						if (token.Kind != TokenKind.Symbol)
+							continue;
+						if (token.Symbol == '{' || token.Symbol == '[' || token.Symbol == '(')
+							depth++;
+						else if ((token.Symbol == '}' || token.Symbol == ']' || token.Symbol == ')') && depth > 0)
+							depth--;
+					}
+				}
+
+				void SkipStatementOrBlock ()
+				{
+					while (true) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							return;
+						if (token.Kind == TokenKind.Symbol && token.Symbol == ';')
+							return;
+						if (token.Kind == TokenKind.Symbol && token.Symbol == '{') {
+							int depth = 1;
+							while (depth > 0) {
+								token = lexer.Read ();
+								if (token.Kind == TokenKind.End)
+									return;
+								if (token.Kind == TokenKind.Symbol && token.Symbol == '{')
+									depth++;
+								else if (token.Kind == TokenKind.Symbol && token.Symbol == '}')
+									depth--;
+							}
+							SkipToStatementEnd ();
+							return;
+						}
+					}
+				}
+			}
+
+			sealed class XkbLexer {
+				readonly string text;
+				int position;
+				Token? peeked;
+
+				public XkbLexer (string text)
+				{
+					this.text = text ?? String.Empty;
+				}
+
+				public bool PeekIs (TokenKind kind)
+				{
+					return Peek ().Kind == kind;
+				}
+
+				public bool PeekIsSymbol (char value)
+				{
+					Token token = Peek ();
+					return token.Kind == TokenKind.Symbol && token.Symbol == value;
+				}
+
+				public Token Peek ()
+				{
+					if (peeked == null)
+						peeked = ReadToken ();
+					return peeked.Value;
+				}
+
+				public Token Read ()
+				{
+					Token token = Peek ();
+					peeked = null;
+					return token;
+				}
+
+				public bool ReadIfIdentifier (string value)
+				{
+					Token token = Peek ();
+					if (token.Kind != TokenKind.Identifier || token.Text != value)
+						return false;
+					Read ();
+					return true;
+				}
+
+				public bool ReadIfSymbol (char value)
+				{
+					Token token = Peek ();
+					if (token.Kind != TokenKind.Symbol || token.Symbol != value)
+						return false;
+					Read ();
+					return true;
+				}
+
+				Token ReadToken ()
+				{
+					SkipWhitespaceAndComments ();
+					if (position >= text.Length)
+						return new Token { Kind = TokenKind.End };
+
+					char c = text [position++];
+					if (c == '"')
+						return ReadString ();
+					if (c == '<')
+						return ReadKeyName ();
+					if (Char.IsDigit (c))
+						return ReadNumber (c);
+					if (IsIdentifierStart (c))
+						return ReadIdentifier (c);
+
+					Token token = new Token ();
+					token.Kind = TokenKind.Symbol;
+					token.Symbol = c;
+					return token;
+				}
+
+				Token ReadString ()
+				{
+					StringBuilder builder = new StringBuilder ();
+					while (position < text.Length) {
+						char c = text [position++];
+						if (c == '"')
+							break;
+						if (c == '\\' && position < text.Length) {
+							char escaped = text [position++];
+							switch (escaped) {
+							case 'n': builder.Append ('\n'); break;
+							case 'r': builder.Append ('\r'); break;
+							case 't': builder.Append ('\t'); break;
+							default: builder.Append (escaped); break;
+							}
+						} else
+							builder.Append (c);
+					}
+
+					return new Token { Kind = TokenKind.String, Text = builder.ToString () };
+				}
+
+				Token ReadKeyName ()
+				{
+					int start = position;
+					while (position < text.Length && text [position] != '>')
+						position++;
+					string keyName = text.Substring (start, position - start);
+					if (position < text.Length && text [position] == '>')
+						position++;
+					return new Token { Kind = TokenKind.KeyName, Text = keyName };
+				}
+
+				Token ReadNumber (char first)
+				{
+					int start = position - 1;
+					if (first == '0' && position < text.Length && (text [position] == 'x' || text [position] == 'X')) {
+						position++;
+						while (position < text.Length && IsHexDigit (text [position]))
+							position++;
+						return new Token {
+							Kind = TokenKind.Number,
+							Text = text.Substring (start, position - start),
+							Number = Convert.ToUInt32 (text.Substring (start + 2, position - start - 2), 16)
+						};
+					}
+
+					while (position < text.Length && Char.IsDigit (text [position]))
+						position++;
+					return new Token { Kind = TokenKind.Number, Text = text.Substring (start, position - start), Number = Convert.ToUInt32 (text.Substring (start, position - start), 10) };
+				}
+
+				Token ReadIdentifier (char first)
+				{
+					int start = position - 1;
+					while (position < text.Length && IsIdentifierPart (text [position]))
+						position++;
+					return new Token { Kind = TokenKind.Identifier, Text = text.Substring (start, position - start) };
+				}
+
+				void SkipWhitespaceAndComments ()
+				{
+					while (position < text.Length) {
+						char c = text [position];
+						if (Char.IsWhiteSpace (c)) {
+							position++;
+							continue;
+						}
+
+						if (c == '/' && position + 1 < text.Length && text [position + 1] == '/') {
+							position += 2;
+							while (position < text.Length && text [position] != '\n')
+								position++;
+							continue;
+						}
+
+						if (c == '/' && position + 1 < text.Length && text [position + 1] == '*') {
+							position += 2;
+							while (position + 1 < text.Length && !(text [position] == '*' && text [position + 1] == '/'))
+								position++;
+							if (position + 1 < text.Length)
+								position += 2;
+							continue;
+						}
+
+						break;
+					}
+				}
+
+				static bool IsIdentifierStart (char c)
+				{
+					return Char.IsLetter (c) || c == '_';
+				}
+
+				static bool IsIdentifierPart (char c)
+				{
+					return Char.IsLetterOrDigit (c) || c == '_';
+				}
+
+				static bool IsHexDigit (char c)
+				{
+					return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+				}
+			}
+
+			struct XkbLevelSelection {
+				public int Level;
+				public uint ConsumedModifiers;
+			}
+
+			static readonly string [] EmptyStringArray = new string [0];
+			readonly Dictionary<uint, Key> keys;
+			uint activeModifiers;
+			uint activeGroup;
+			Keys modifierKeys;
+
+			ManagedXkbKeyboardLayout (Dictionary<uint, Key> keys)
+			{
+				this.keys = keys;
+			}
+
+			public int KeyCount {
+				get { return keys.Count; }
+			}
+
 			public static IWaylandKeyboardLayout TryCreate (WaylandKeymap keymap, out string diagnostic)
 			{
-				diagnostic = "managed XKB parser is not implemented";
-				return null;
+				diagnostic = null;
+				if (keymap.Format != WaylandProtocol.WlKeyboard.KeymapFormatXkbV1) {
+					diagnostic = "unsupported Wayland keymap format " + keymap.Format.ToString ();
+					return null;
+				}
+				if (String.IsNullOrEmpty (keymap.Text)) {
+					diagnostic = "empty xkb_v1 keymap text";
+					return null;
+				}
+
+				Dictionary<uint, Key> keys;
+				Parser parser = new Parser (keymap.Text);
+				if (!parser.TryParse (out keys, out diagnostic))
+					return null;
+
+				int printableKeys = CountPrintableKeys (keys);
+				if (printableKeys == 0) {
+					diagnostic = "managed XKB parser found no printable key symbols";
+					return null;
+				}
+
+				diagnostic = "parsed " + keys.Count.ToString () + " keys, " + printableKeys.ToString () + " printable";
+				return new ManagedXkbKeyboardLayout (keys);
 			}
 
 			public Keys ModifierKeys {
-				get { return Keys.None; }
+				get { return modifierKeys; }
 			}
 
 			public void SetModifiers (uint depressed, uint latched, uint locked, uint group)
 			{
+				activeModifiers = depressed | latched | locked;
+				activeGroup = group;
+				modifierKeys = KeysFromModifierMask (activeModifiers);
 			}
 
 			public WaylandKeyResult TranslateKey (uint evdevKey, bool pressed)
 			{
-				return new WaylandKeyResult ();
+				WaylandKeyResult result = new WaylandKeyResult ();
+				result.ShortcutModifiers = modifierKeys;
+				result.HasShortcutModifiers = true;
+
+				Key key;
+				if (!keys.TryGetValue (evdevKey + XkbKeycodeOffset, out key)) {
+					result.KeyCode = MapEvdevKey (evdevKey);
+					return result;
+				}
+
+				KeyGroup group = SelectGroup (key);
+				if (group == null || group.Symbols == null || group.Symbols.Length == 0) {
+					result.KeyCode = MapEvdevKey (evdevKey);
+					return result;
+				}
+
+				XkbLevelSelection selection = SelectLevel (group.Type);
+				result.ShortcutModifiers = KeysFromModifierMask (activeModifiers & ~selection.ConsumedModifiers);
+
+				XkbSymbol symbol = selection.Level >= 0 && selection.Level < group.Symbols.Length ? group.Symbols [selection.Level] : NoSymbol ();
+				if (!symbol.NoSymbol) {
+					result.KeyCode = MapKeysymToKeys (symbol.Keysym);
+					if (pressed && !String.IsNullOrEmpty (symbol.Text) && (result.ShortcutModifiers & Keys.Control) == 0)
+						result.Text = symbol.Text;
+				}
+				if (result.KeyCode == Keys.None)
+					result.KeyCode = MapEvdevKey (evdevKey);
+				return result;
 			}
 
 			public void Dispose ()
 			{
+			}
+
+			KeyGroup SelectGroup (Key key)
+			{
+				int group = activeGroup <= Int32.MaxValue ? (int) activeGroup : 0;
+				if (key.Groups != null && group >= 0 && group < key.Groups.Length && key.Groups [group] != null)
+					return key.Groups [group];
+				if (key.Groups != null && key.Groups.Length > 0)
+					return key.Groups [0];
+				return null;
+			}
+
+			XkbLevelSelection SelectLevel (XkbResolvedType type)
+			{
+				XkbLevelSelection selection = new XkbLevelSelection ();
+				uint selector = activeModifiers & type.ModifierMask;
+				int level;
+				if (type.Levels.TryGetValue (selector, out level))
+					selection.Level = level;
+				else
+					selection.Level = 0;
+
+				uint preserve;
+				if (!type.Preserves.TryGetValue (selector, out preserve))
+					preserve = 0;
+				selection.ConsumedModifiers = type.ModifierMask & ~preserve;
+				return selection;
+			}
+
+			static string TokenText (Token token)
+			{
+				if (token.Kind == TokenKind.Number)
+					return token.Text ?? token.Number.ToString ();
+				return token.Text;
+			}
+
+			static bool TryParseLevel (Token token, out int level)
+			{
+				level = 0;
+				string text = TokenText (token);
+				if (String.IsNullOrEmpty (text))
+					return false;
+				if (text.StartsWith ("Level", StringComparison.Ordinal)) {
+					int value;
+					if (Int32.TryParse (text.Substring (5), out value) && value > 0) {
+						level = value - 1;
+						return true;
+					}
+				}
+				if (token.Kind == TokenKind.Number && token.Number > 0) {
+					level = checked ((int) token.Number - 1);
+					return true;
+				}
+				return false;
+			}
+
+			static string InferTypeName (XkbSymbol [] symbols)
+			{
+				int length = NormalizedSymbolLength (symbols);
+				switch (length) {
+				case 0:
+				case 1:
+					return "ONE_LEVEL";
+				case 2:
+					if (IsLowerUpperLetterPair (symbols [0], symbols [1]))
+						return "ALPHABETIC";
+					if (IsKeypadSymbol (symbols [0]) || IsKeypadSymbol (symbols [1]))
+						return "KEYPAD";
+					return "TWO_LEVEL";
+				case 3:
+				case 4:
+					if (IsLowerUpperLetterPair (symbols [0], symbols [1])) {
+						if (IsLowerUpperLetterPair (symbols [2], SymbolAt (symbols, 3)))
+							return "FOUR_LEVEL_ALPHABETIC";
+						return "FOUR_LEVEL_SEMIALPHABETIC";
+					}
+					if (IsKeypadSymbol (symbols [0]) || IsKeypadSymbol (symbols [1]))
+						return "FOUR_LEVEL_KEYPAD";
+					return "FOUR_LEVEL";
+				default:
+					return "ONE_LEVEL";
+				}
+			}
+
+			static int NormalizedSymbolLength (XkbSymbol [] symbols)
+			{
+				int length = symbols == null ? 0 : symbols.Length;
+				while (length > 0 && symbols [length - 1].NoSymbol)
+					length--;
+				return length;
+			}
+
+			static XkbSymbol SymbolAt (XkbSymbol [] symbols, int index)
+			{
+				if (symbols == null || index < 0 || index >= symbols.Length)
+					return NoSymbol ();
+				return symbols [index];
+			}
+
+			static bool IsLowerUpperLetterPair (XkbSymbol lower, XkbSymbol upper)
+			{
+				return IsLowerLetterSymbol (lower) && IsUpperLetterSymbol (upper);
+			}
+
+			static bool IsLowerLetterSymbol (XkbSymbol symbol)
+			{
+				if (String.IsNullOrEmpty (symbol.Text) || symbol.Text.Length != 1)
+					return false;
+				char c = symbol.Text [0];
+				return Char.IsLetter (c) && Char.ToLowerInvariant (c) == c && Char.ToUpperInvariant (c) != c;
+			}
+
+			static bool IsUpperLetterSymbol (XkbSymbol symbol)
+			{
+				if (String.IsNullOrEmpty (symbol.Text) || symbol.Text.Length != 1)
+					return false;
+				char c = symbol.Text [0];
+				return Char.IsLetter (c) && Char.ToUpperInvariant (c) == c && Char.ToLowerInvariant (c) != c;
+			}
+
+			static bool IsKeypadSymbol (XkbSymbol symbol)
+			{
+				return symbol.Keysym >= XkbKeysymKpEnter && symbol.Keysym <= XkbKeysymKpDivide ||
+					symbol.Keysym >= XkbKeysymKp0 && symbol.Keysym <= XkbKeysymKp9;
+			}
+
+			static bool TryCreateSymbol (string name, out XkbSymbol symbol)
+			{
+				symbol = NoSymbol ();
+				if (String.IsNullOrEmpty (name) || name == "NoSymbol")
+					return true;
+
+				uint keysym;
+				if (!TryKeysymFromName (name, out keysym)) {
+					if (name.StartsWith ("dead_", StringComparison.Ordinal)) {
+						symbol.NoSymbol = false;
+						symbol.Name = name;
+						symbol.Keysym = XkbKeysymIsoSpecialStart;
+						return true;
+					}
+					return false;
+				}
+
+				symbol.NoSymbol = false;
+				symbol.Name = name;
+				symbol.Keysym = keysym;
+				symbol.Text = TextFromKeysym (keysym);
+				return true;
+			}
+
+			static XkbSymbol NoSymbol ()
+			{
+				XkbSymbol symbol = new XkbSymbol ();
+				symbol.NoSymbol = true;
+				return symbol;
+			}
+
+			static int CountPrintableKeys (Dictionary<uint, Key> keys)
+			{
+				int count = 0;
+				foreach (Key key in keys.Values) {
+					if (key.Groups == null)
+						continue;
+					bool hasText = false;
+					for (int group = 0; group < key.Groups.Length && !hasText; group++) {
+						KeyGroup keyGroup = key.Groups [group];
+						if (keyGroup == null || keyGroup.Symbols == null)
+							continue;
+						for (int level = 0; level < keyGroup.Symbols.Length; level++) {
+							if (!String.IsNullOrEmpty (keyGroup.Symbols [level].Text)) {
+								hasText = true;
+								break;
+							}
+						}
+					}
+					if (hasText)
+						count++;
+				}
+				return count;
+			}
+
+			static readonly Dictionary<string, uint> namedKeysyms = CreateNamedKeysyms ();
+
+			static bool TryKeysymFromName (string name, out uint keysym)
+			{
+				keysym = 0;
+				if (String.IsNullOrEmpty (name) || name == "VoidSymbol")
+					return false;
+
+				if (name.Length == 1) {
+					keysym = name [0];
+					return true;
+				}
+
+				if (name.Length > 1 && name [0] == 'U') {
+					uint codepoint;
+					if (TryParseHex (name, 1, out codepoint) && codepoint <= UnicodeMaxCodePoint) {
+						keysym = XkbKeysymUnicodePrefix | codepoint;
+						return true;
+					}
+				}
+
+				if (name.Length > 1 && name [0] == '0' && (name [1] == 'x' || name [1] == 'X'))
+					return TryParseHex (name, 2, out keysym);
+
+				if (name.Length > 1 && name [0] == 'F') {
+					uint functionNumber;
+					if (UInt32.TryParse (name.Substring (1), out functionNumber) && functionNumber >= 1 && functionNumber <= 35) {
+						keysym = XkbKeysymF1 + functionNumber - 1;
+						return true;
+					}
+				}
+
+				return namedKeysyms.TryGetValue (name, out keysym);
+			}
+
+			static bool TryParseHex (string text, int offset, out uint value)
+			{
+				value = 0;
+				if (offset >= text.Length)
+					return false;
+
+				for (int i = offset; i < text.Length; i++) {
+					char c = text [i];
+					uint digit;
+					if (c >= '0' && c <= '9')
+						digit = (uint) (c - '0');
+					else if (c >= 'a' && c <= 'f')
+						digit = (uint) (c - 'a' + 10);
+					else if (c >= 'A' && c <= 'F')
+						digit = (uint) (c - 'A' + 10);
+					else
+						return false;
+					value = (value << 4) | digit;
+				}
+
+				return true;
+			}
+
+			static string TextFromKeysym (uint keysym)
+			{
+				switch (keysym) {
+				case XkbKeysymBackSpace: return "\b";
+				case XkbKeysymTab: return "\t";
+				case XkbKeysymReturn: return "\r";
+				}
+
+				if (keysym >= XkbKeysymIsoSpecialStart && keysym <= XkbKeysymSpecialEnd)
+					return null;
+
+				uint codepoint = keysym;
+				if ((keysym & XkbKeysymUnicodePrefixMask) == XkbKeysymUnicodePrefix)
+					codepoint = keysym & XkbKeysymUnicodeCodepointMask;
+				if (codepoint == 0 || codepoint > UnicodeMaxCodePoint)
+					return null;
+				return Char.ConvertFromUtf32 ((int) codepoint);
+			}
+
+			static Keys KeysFromModifierMask (uint mask)
+			{
+				Keys keys = Keys.None;
+				if ((mask & XkbModifierShiftMask) != 0)
+					keys |= Keys.Shift;
+				if ((mask & XkbModifierControlMask) != 0)
+					keys |= Keys.Control;
+				if ((mask & XkbModifierMod1Mask) != 0)
+					keys |= Keys.Alt;
+				return keys;
+			}
+
+			static bool IsNoModifierName (string name)
+			{
+				return name == "none" || name == "None";
+			}
+
+			static bool IsUnsupportedModifierWildcard (string name)
+			{
+				return name == "all" || name == "All" || name == "any" || name == "Any";
+			}
+
+			static Dictionary<string, uint> CreateNamedKeysyms ()
+			{
+				Dictionary<string, uint> keysyms = new Dictionary<string, uint> (StringComparer.Ordinal);
+
+				AddAsciiKeysyms (keysyms);
+				AddLatin1Keysyms (keysyms);
+				AddControlKeysyms (keysyms);
+				AddKeypadKeysyms (keysyms);
+
+				keysyms ["EuroSign"] = 0x20ac;
+				keysyms ["OE"] = 0x0152;
+				keysyms ["oe"] = 0x0153;
+				keysyms ["Ydiaeresis"] = 0x0178;
+				return keysyms;
+			}
+
+			static void AddAsciiKeysyms (Dictionary<string, uint> keysyms)
+			{
+				keysyms ["space"] = ' ';
+				keysyms ["exclam"] = '!';
+				keysyms ["quotedbl"] = '"';
+				keysyms ["numbersign"] = '#';
+				keysyms ["dollar"] = '$';
+				keysyms ["percent"] = '%';
+				keysyms ["ampersand"] = '&';
+				keysyms ["apostrophe"] = '\'';
+				keysyms ["quoteright"] = '\'';
+				keysyms ["parenleft"] = '(';
+				keysyms ["parenright"] = ')';
+				keysyms ["asterisk"] = '*';
+				keysyms ["plus"] = '+';
+				keysyms ["comma"] = ',';
+				keysyms ["minus"] = '-';
+				keysyms ["period"] = '.';
+				keysyms ["slash"] = '/';
+				keysyms ["colon"] = ':';
+				keysyms ["semicolon"] = ';';
+				keysyms ["less"] = '<';
+				keysyms ["equal"] = '=';
+				keysyms ["greater"] = '>';
+				keysyms ["question"] = '?';
+				keysyms ["at"] = '@';
+				keysyms ["bracketleft"] = '[';
+				keysyms ["backslash"] = '\\';
+				keysyms ["bracketright"] = ']';
+				keysyms ["asciicircum"] = '^';
+				keysyms ["underscore"] = '_';
+				keysyms ["grave"] = '`';
+				keysyms ["quoteleft"] = '`';
+				keysyms ["braceleft"] = '{';
+				keysyms ["bar"] = '|';
+				keysyms ["braceright"] = '}';
+				keysyms ["asciitilde"] = '~';
+			}
+
+			static void AddLatin1Keysyms (Dictionary<string, uint> keysyms)
+			{
+				keysyms ["nobreakspace"] = 0x00a0;
+				keysyms ["exclamdown"] = 0x00a1;
+				keysyms ["cent"] = 0x00a2;
+				keysyms ["sterling"] = 0x00a3;
+				keysyms ["currency"] = 0x00a4;
+				keysyms ["yen"] = 0x00a5;
+				keysyms ["brokenbar"] = 0x00a6;
+				keysyms ["section"] = 0x00a7;
+				keysyms ["diaeresis"] = 0x00a8;
+				keysyms ["copyright"] = 0x00a9;
+				keysyms ["ordfeminine"] = 0x00aa;
+				keysyms ["guillemotleft"] = 0x00ab;
+				keysyms ["notsign"] = 0x00ac;
+				keysyms ["hyphen"] = 0x00ad;
+				keysyms ["registered"] = 0x00ae;
+				keysyms ["macron"] = 0x00af;
+				keysyms ["degree"] = 0x00b0;
+				keysyms ["plusminus"] = 0x00b1;
+				keysyms ["twosuperior"] = 0x00b2;
+				keysyms ["threesuperior"] = 0x00b3;
+				keysyms ["acute"] = 0x00b4;
+				keysyms ["mu"] = 0x00b5;
+				keysyms ["paragraph"] = 0x00b6;
+				keysyms ["periodcentered"] = 0x00b7;
+				keysyms ["cedilla"] = 0x00b8;
+				keysyms ["onesuperior"] = 0x00b9;
+				keysyms ["masculine"] = 0x00ba;
+				keysyms ["guillemotright"] = 0x00bb;
+				keysyms ["onequarter"] = 0x00bc;
+				keysyms ["onehalf"] = 0x00bd;
+				keysyms ["threequarters"] = 0x00be;
+				keysyms ["questiondown"] = 0x00bf;
+				AddLatinPair (keysyms, "Agrave", "agrave", 0x00c0, 0x00e0);
+				AddLatinPair (keysyms, "Aacute", "aacute", 0x00c1, 0x00e1);
+				AddLatinPair (keysyms, "Acircumflex", "acircumflex", 0x00c2, 0x00e2);
+				AddLatinPair (keysyms, "Atilde", "atilde", 0x00c3, 0x00e3);
+				AddLatinPair (keysyms, "Adiaeresis", "adiaeresis", 0x00c4, 0x00e4);
+				AddLatinPair (keysyms, "Aring", "aring", 0x00c5, 0x00e5);
+				AddLatinPair (keysyms, "AE", "ae", 0x00c6, 0x00e6);
+				AddLatinPair (keysyms, "Ccedilla", "ccedilla", 0x00c7, 0x00e7);
+				AddLatinPair (keysyms, "Egrave", "egrave", 0x00c8, 0x00e8);
+				AddLatinPair (keysyms, "Eacute", "eacute", 0x00c9, 0x00e9);
+				AddLatinPair (keysyms, "Ecircumflex", "ecircumflex", 0x00ca, 0x00ea);
+				AddLatinPair (keysyms, "Ediaeresis", "ediaeresis", 0x00cb, 0x00eb);
+				AddLatinPair (keysyms, "Igrave", "igrave", 0x00cc, 0x00ec);
+				AddLatinPair (keysyms, "Iacute", "iacute", 0x00cd, 0x00ed);
+				AddLatinPair (keysyms, "Icircumflex", "icircumflex", 0x00ce, 0x00ee);
+				AddLatinPair (keysyms, "Idiaeresis", "idiaeresis", 0x00cf, 0x00ef);
+				keysyms ["ETH"] = 0x00d0;
+				keysyms ["eth"] = 0x00f0;
+				AddLatinPair (keysyms, "Ntilde", "ntilde", 0x00d1, 0x00f1);
+				AddLatinPair (keysyms, "Ograve", "ograve", 0x00d2, 0x00f2);
+				AddLatinPair (keysyms, "Oacute", "oacute", 0x00d3, 0x00f3);
+				AddLatinPair (keysyms, "Ocircumflex", "ocircumflex", 0x00d4, 0x00f4);
+				AddLatinPair (keysyms, "Otilde", "otilde", 0x00d5, 0x00f5);
+				AddLatinPair (keysyms, "Odiaeresis", "odiaeresis", 0x00d6, 0x00f6);
+				keysyms ["multiply"] = 0x00d7;
+				AddLatinPair (keysyms, "Oslash", "oslash", 0x00d8, 0x00f8);
+				AddLatinPair (keysyms, "Ugrave", "ugrave", 0x00d9, 0x00f9);
+				AddLatinPair (keysyms, "Uacute", "uacute", 0x00da, 0x00fa);
+				AddLatinPair (keysyms, "Ucircumflex", "ucircumflex", 0x00db, 0x00fb);
+				AddLatinPair (keysyms, "Udiaeresis", "udiaeresis", 0x00dc, 0x00fc);
+				AddLatinPair (keysyms, "Yacute", "yacute", 0x00dd, 0x00fd);
+				keysyms ["THORN"] = 0x00de;
+				keysyms ["thorn"] = 0x00fe;
+				keysyms ["ssharp"] = 0x00df;
+				keysyms ["division"] = 0x00f7;
+				keysyms ["ydiaeresis"] = 0x00ff;
+			}
+
+			static void AddLatinPair (Dictionary<string, uint> keysyms, string upperName, string lowerName, uint upper, uint lower)
+			{
+				keysyms [upperName] = upper;
+				keysyms [lowerName] = lower;
+			}
+
+			static void AddControlKeysyms (Dictionary<string, uint> keysyms)
+			{
+				keysyms ["BackSpace"] = XkbKeysymBackSpace;
+				keysyms ["Tab"] = XkbKeysymTab;
+				keysyms ["ISO_Left_Tab"] = XkbKeysymTab;
+				keysyms ["Return"] = XkbKeysymReturn;
+				keysyms ["Pause"] = XkbKeysymPause;
+				keysyms ["Scroll_Lock"] = XkbKeysymScrollLock;
+				keysyms ["Escape"] = XkbKeysymEscape;
+				keysyms ["Home"] = XkbKeysymHome;
+				keysyms ["Left"] = XkbKeysymLeft;
+				keysyms ["Up"] = XkbKeysymUp;
+				keysyms ["Right"] = XkbKeysymRight;
+				keysyms ["Down"] = XkbKeysymDown;
+				keysyms ["Prior"] = XkbKeysymPageUp;
+				keysyms ["Page_Up"] = XkbKeysymPageUp;
+				keysyms ["Next"] = XkbKeysymPageDown;
+				keysyms ["Page_Down"] = XkbKeysymPageDown;
+				keysyms ["End"] = XkbKeysymEnd;
+				keysyms ["Print"] = XkbKeysymPrint;
+				keysyms ["Insert"] = XkbKeysymInsert;
+				keysyms ["Menu"] = XkbKeysymMenu;
+				keysyms ["Help"] = XkbKeysymHelp;
+				keysyms ["Break"] = XkbKeysymBreak;
+				keysyms ["Num_Lock"] = XkbKeysymNumLock;
+				keysyms ["Delete"] = XkbKeysymDelete;
+				keysyms ["Shift_L"] = XkbKeysymShiftL;
+				keysyms ["Shift_R"] = XkbKeysymShiftR;
+				keysyms ["Control_L"] = XkbKeysymControlL;
+				keysyms ["Control_R"] = XkbKeysymControlR;
+				keysyms ["Caps_Lock"] = XkbKeysymCapsLock;
+				keysyms ["Meta_L"] = XkbKeysymMetaL;
+				keysyms ["Meta_R"] = XkbKeysymMetaR;
+				keysyms ["Alt_L"] = XkbKeysymAltL;
+				keysyms ["Alt_R"] = XkbKeysymAltR;
+				keysyms ["Super_L"] = XkbKeysymSuperL;
+				keysyms ["Super_R"] = XkbKeysymSuperR;
+				keysyms ["Hyper_L"] = XkbKeysymHyperL;
+				keysyms ["Hyper_R"] = XkbKeysymHyperR;
+				keysyms ["Mode_switch"] = XkbKeysymModeSwitch;
+				keysyms ["ISO_Level3_Shift"] = XkbKeysymIsoLevel3Shift;
+			}
+
+			static void AddKeypadKeysyms (Dictionary<string, uint> keysyms)
+			{
+				keysyms ["KP_Enter"] = XkbKeysymKpEnter;
+				keysyms ["KP_Multiply"] = XkbKeysymKpMultiply;
+				keysyms ["KP_Add"] = XkbKeysymKpAdd;
+				keysyms ["KP_Separator"] = XkbKeysymKpSeparator;
+				keysyms ["KP_Subtract"] = XkbKeysymKpSubtract;
+				keysyms ["KP_Decimal"] = XkbKeysymKpDecimal;
+				keysyms ["KP_Divide"] = XkbKeysymKpDivide;
+				for (uint i = 0; i <= 9; i++)
+					keysyms ["KP_" + i.ToString ()] = XkbKeysymKp0 + i;
+				for (uint i = 1; i <= 35; i++)
+					keysyms ["F" + i.ToString ()] = XkbKeysymF1 + i - 1;
+			}
+
+			static uint ModifierMaskForName (string name)
+			{
+				switch (name) {
+				case "Shift": return XkbModifierShiftMask;
+				case "Lock": return XkbModifierLockMask;
+				case "Control": return XkbModifierControlMask;
+				case "Mod1": return XkbModifierMod1Mask;
+				case "Mod2": return XkbModifierMod2Mask;
+				case "Mod3": return XkbModifierMod3Mask;
+				case "Mod4": return XkbModifierMod4Mask;
+				case "Mod5": return XkbModifierMod5Mask;
+				default: return 0;
+				}
 			}
 		}
 
@@ -264,6 +2052,7 @@ namespace System.Windows.Forms {
 			uint shiftIndex = UInt32.MaxValue;
 			uint controlIndex = UInt32.MaxValue;
 			uint altIndex = UInt32.MaxValue;
+			uint activeModifiers;
 			Keys modifierKeys;
 
 			LibXkbCommonKeyboardLayout (IntPtr context, IntPtr keymap, IntPtr state)
@@ -279,8 +2068,12 @@ namespace System.Windows.Forms {
 			public static IWaylandKeyboardLayout TryCreate (WaylandKeymap waylandKeymap, out string diagnostic)
 			{
 				diagnostic = null;
-				if (waylandKeymap.Format != WaylandProtocol.WlKeyboard.KeymapFormatXkbV1 || String.IsNullOrEmpty (waylandKeymap.Text)) {
-					diagnostic = "unsupported Wayland keymap format";
+				if (waylandKeymap.Format != WaylandProtocol.WlKeyboard.KeymapFormatXkbV1) {
+					diagnostic = "unsupported Wayland keymap format " + waylandKeymap.Format.ToString ();
+					return null;
+				}
+				if (String.IsNullOrEmpty (waylandKeymap.Text)) {
+					diagnostic = "empty xkb_v1 keymap text";
 					return null;
 				}
 
@@ -333,25 +2126,28 @@ namespace System.Windows.Forms {
 			{
 				xkb_state_update_mask (state, depressed, latched, locked, 0, 0, group);
 				Keys keys = Keys.None;
-				uint active = depressed | latched | locked;
-				if (IsMaskActive (active, shiftIndex))
+				activeModifiers = depressed | latched | locked;
+				if (IsMaskActive (activeModifiers, shiftIndex))
 					keys |= Keys.Shift;
-				if (IsMaskActive (active, controlIndex))
+				if (IsMaskActive (activeModifiers, controlIndex))
 					keys |= Keys.Control;
-				if (IsMaskActive (active, altIndex))
+				if (IsMaskActive (activeModifiers, altIndex))
 					keys |= Keys.Alt;
 				modifierKeys = keys;
 			}
 
 			public WaylandKeyResult TranslateKey (uint evdevKey, bool pressed)
 			{
-				uint xkbKeycode = evdevKey + 8;
+				uint xkbKeycode = evdevKey + XkbKeycodeOffset;
 				WaylandKeyResult result = new WaylandKeyResult ();
+				uint consumedModifiers = xkb_state_key_get_consumed_mods (state, xkbKeycode);
+				result.ShortcutModifiers = KeysFromNativeMask (activeModifiers & ~consumedModifiers);
+				result.HasShortcutModifiers = true;
 				uint keysym = xkb_state_key_get_one_sym (state, xkbKeycode);
 				result.KeyCode = MapKeysymToKeys (keysym);
 				if (result.KeyCode == Keys.None)
 					result.KeyCode = MapEvdevKey (evdevKey);
-				if (pressed && (modifierKeys & Keys.Control) == 0)
+				if (pressed && (result.ShortcutModifiers & Keys.Control) == 0)
 					result.Text = GetUtf8 (state, xkbKeycode);
 				return result;
 			}
@@ -375,6 +2171,18 @@ namespace System.Windows.Forms {
 			static bool IsMaskActive (uint mask, uint index)
 			{
 				return index != UInt32.MaxValue && index < 32 && (mask & (1u << (int) index)) != 0;
+			}
+
+			Keys KeysFromNativeMask (uint mask)
+			{
+				Keys keys = Keys.None;
+				if (IsMaskActive (mask, shiftIndex))
+					keys |= Keys.Shift;
+				if (IsMaskActive (mask, controlIndex))
+					keys |= Keys.Control;
+				if (IsMaskActive (mask, altIndex))
+					keys |= Keys.Alt;
+				return keys;
 			}
 
 			static string GetUtf8 (IntPtr state, uint xkbKeycode)
@@ -418,6 +2226,9 @@ namespace System.Windows.Forms {
 			static extern uint xkb_state_key_get_one_sym (IntPtr state, uint keycode);
 
 			[DllImport ("libxkbcommon.so.0")]
+			static extern uint xkb_state_key_get_consumed_mods (IntPtr state, uint keycode);
+
+			[DllImport ("libxkbcommon.so.0")]
 			static extern int xkb_state_key_get_utf8 (IntPtr state, uint keycode, byte [] buffer, UIntPtr size);
 		}
 
@@ -432,9 +2243,11 @@ namespace System.Windows.Forms {
 		readonly List<Timer> timers = new List<Timer> ();
 		readonly Bitmap fallbackBitmap = new Bitmap (1, 1, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
 		readonly HashSet<uint> evdevKeysDown = new HashSet<uint> ();
+		readonly Dictionary<uint, bool> keySysState = new Dictionary<uint, bool> ();
 		readonly Dictionary<string, string> keyText = new Dictionary<string, string> ();
 		readonly WaylandCaret caret = new WaylandCaret ();
 		IWaylandKeyboardLayout keyboardLayout = new PhysicalUsKeyboardLayout ();
+		bool menuState;
 
 		WaylandConnection connection;
 		WaylandRegistry registry;
@@ -1243,6 +3056,18 @@ namespace System.Windows.Forms {
 
 		internal override bool TranslateMessage (ref MSG msg)
 		{
+			// This mirrors Mono's X11Keyboard.menu_state.  A bare Alt
+			// press/release is menu activation, but an Alt chord is not: after
+			// Alt+key, the later Alt release must be delivered as a normal key-up
+			// so Mono does not activate menu keyboard capture after the chord.
+			if (msg.message == Msg.WM_SYSKEYUP && (Keys) msg.wParam.ToInt32 () == Keys.Menu && menuState) {
+				msg.message = Msg.WM_KEYUP;
+				menuState = false;
+			}
+
+			if (msg.message == Msg.WM_SYSKEYDOWN && ((Keys) msg.wParam.ToInt32 () & Keys.KeyCode) != Keys.Menu)
+				menuState = true;
+
 			string text;
 			string key = GetKeyTextKey (msg);
 			if (!keyText.TryGetValue (key, out text))
@@ -3115,38 +4940,47 @@ namespace System.Windows.Forms {
 		{
 			uint format = reader.ReadUInt32 ();
 			uint size = reader.ReadUInt32 ();
+			bool debugKeyboard = Environment.GetEnvironmentVariable ("MONO_WAYLAND_DEBUG_KEYBOARD") == "1";
+
+			if (debugKeyboard)
+				Console.Error.WriteLine ("Wayland keyboard keymap event: format=" + format.ToString () +
+					" size=" + size.ToString () + " pending_fds=" + connection.PendingFdCount.ToString ());
 
 			if (format == WaylandProtocol.WlKeyboard.KeymapFormatNoKeymap) {
-				ResetKeyboardLayout ();
+				ResetKeyboardLayout ("compositor sent no_keymap");
 				return;
 			}
 
-			if (message.Fds.Length == 0) {
-				ResetKeyboardLayout ();
+			int fd;
+			if (!connection.TryTakeFd (out fd)) {
+				ResetKeyboardLayout ("keymap event had no received fd");
 				return;
 			}
 
 			WaylandKeymap keymap;
 			try {
-				keymap = WaylandKeymap.ReadFromFd (format, message.Fds [0], size);
+				keymap = WaylandKeymap.ReadFromFd (format, fd, size);
 			} catch {
-				ResetKeyboardLayout ();
+				ResetKeyboardLayout ("failed to read keymap fd");
 				return;
-			} finally {
-				for (int i = 1; i < message.Fds.Length; i++)
-					Syscall.close (message.Fds [i]);
 			}
+
+			if (debugKeyboard)
+				Console.Error.WriteLine ("Wayland keyboard keymap payload: bytes=" + keymap.Bytes.Length.ToString () +
+					" text=" + keymap.Text.Length.ToString ());
 
 			InstallKeyboardLayout (keymap);
 		}
 
 		void InstallKeyboardLayout (WaylandKeymap keymap)
 		{
-			string diagnostic;
-			IWaylandKeyboardLayout layout = ManagedXkbKeyboardLayout.TryCreate (keymap, out diagnostic);
+			string managedDiagnostic;
+			string nativeDiagnostic = null;
+			IWaylandKeyboardLayout layout = ManagedXkbKeyboardLayout.TryCreate (keymap, out managedDiagnostic);
 			if (layout == null)
-				layout = LibXkbCommonKeyboardLayout.TryCreate (keymap, out diagnostic);
-			if (layout == null)
+				layout = LibXkbCommonKeyboardLayout.TryCreate (keymap, out nativeDiagnostic);
+			bool physicalFallback = layout == null;
+			if (physicalFallback)
 				layout = new PhysicalUsKeyboardLayout ();
 
 			keyboardLayout.Dispose ();
@@ -3154,9 +4988,24 @@ namespace System.Windows.Forms {
 			keyboardLayout.SetModifiers (keyboardModsDepressed, keyboardModsLatched, keyboardModsLocked, keyboardGroup);
 			modifierKeys = keyboardLayout.ModifierKeys;
 			keyText.Clear ();
+			keySysState.Clear ();
+			if (Environment.GetEnvironmentVariable ("MONO_WAYLAND_DEBUG_KEYBOARD") == "1") {
+				Console.Error.WriteLine ("Wayland keyboard layout: " + keyboardLayout.GetType ().Name);
+				if (!String.IsNullOrEmpty (managedDiagnostic))
+					Console.Error.WriteLine ("Wayland keyboard managed XKB: " + managedDiagnostic);
+				if (!String.IsNullOrEmpty (nativeDiagnostic))
+					Console.Error.WriteLine ("Wayland keyboard libxkbcommon: " + nativeDiagnostic);
+				if (physicalFallback)
+					Console.Error.WriteLine ("Wayland keyboard fallback: PhysicalUsKeyboardLayout");
+			}
 		}
 
 		void ResetKeyboardLayout ()
+		{
+			ResetKeyboardLayout (null);
+		}
+
+		void ResetKeyboardLayout (string reason)
 		{
 			keyboardLayout.Dispose ();
 			keyboardLayout = new PhysicalUsKeyboardLayout ();
@@ -3166,6 +5015,11 @@ namespace System.Windows.Forms {
 			keyboardModsLocked = 0;
 			keyboardGroup = 0;
 			keyText.Clear ();
+			keySysState.Clear ();
+			if (!String.IsNullOrEmpty (reason) && Environment.GetEnvironmentVariable ("MONO_WAYLAND_DEBUG_KEYBOARD") == "1") {
+				Console.Error.WriteLine ("Wayland keyboard layout: PhysicalUsKeyboardLayout");
+				Console.Error.WriteLine ("Wayland keyboard fallback: " + reason);
+			}
 		}
 
 		void HandleKeyboardKey (WaylandMessageReader reader)
@@ -3177,11 +5031,15 @@ namespace System.Windows.Forms {
 			bool pressed = state == WaylandProtocol.WlKeyboard.KeyStatePressed;
 			bool wasDown = evdevKeysDown.Contains (evdevKey);
 			Keys oldModifiers = modifierKeys;
+			bool storedSysKey = false;
+			bool hasStoredSysKey = !pressed && keySysState.TryGetValue (evdevKey, out storedSysKey);
 
 			if (pressed)
 				evdevKeysDown.Add (evdevKey);
-			else
+			else {
 				evdevKeysDown.Remove (evdevKey);
+				keySysState.Remove (evdevKey);
+			}
 
 			WaylandKeyResult result = keyboardLayout.TranslateKey (evdevKey, pressed);
 			modifierKeys = keyboardLayout.ModifierKeys;
@@ -3201,8 +5059,18 @@ namespace System.Windows.Forms {
 			if (target == IntPtr.Zero)
 				return;
 
-			Keys sysModifiers = pressed ? modifierKeys : oldModifiers;
-			bool sysKey = (sysModifiers & Keys.Alt) != 0 && (sysModifiers & Keys.Control) == 0;
+			Keys shortcutModifiers = result.HasShortcutModifiers ? result.ShortcutModifiers : (pressed ? modifierKeys : oldModifiers);
+			bool sysKey;
+			if (pressed) {
+				// WM_SYSKEYUP must match the key-down classification.  XKB may
+				// consume Alt-like modifiers for text selection, and release
+				// events arrive after the modifier state has changed.
+				sysKey = IsSystemKeyModifierState (shortcutModifiers);
+				keySysState [evdevKey] = sysKey;
+			} else if (hasStoredSysKey)
+				sysKey = storedSysKey;
+			else
+				sysKey = IsSystemKeyModifierState (shortcutModifiers);
 			Msg message = pressed ? (sysKey ? Msg.WM_SYSKEYDOWN : Msg.WM_KEYDOWN) : (sysKey ? Msg.WM_SYSKEYUP : Msg.WM_KEYUP);
 			IntPtr lParam = MakeKeyLParam (evdevKey, pressed, wasDown, sysKey);
 
@@ -3744,6 +5612,11 @@ namespace System.Windows.Forms {
 			return (IntPtr) value;
 		}
 
+		static bool IsSystemKeyModifierState (Keys modifiers)
+		{
+			return (modifiers & Keys.Alt) != 0 && (modifiers & Keys.Control) == 0;
+		}
+
 		static string GetKeyTextKey (MSG msg)
 		{
 			return msg.hwnd.ToInt64 ().ToString ("x") + ":" + ((int) msg.message).ToString ("x") + ":" +
@@ -3759,43 +5632,43 @@ namespace System.Windows.Forms {
 				return (Keys) ((int) Keys.A + (int) (keysym - 'A'));
 			if (keysym >= '0' && keysym <= '9')
 				return (Keys) ((int) Keys.D0 + (int) (keysym - '0'));
-			if (keysym >= 0xffbe && keysym <= 0xffc9)
-				return (Keys) ((int) Keys.F1 + (int) (keysym - 0xffbe));
-			if (keysym >= 0xffb0 && keysym <= 0xffb9)
-				return (Keys) ((int) Keys.NumPad0 + (int) (keysym - 0xffb0));
+			if (keysym >= XkbKeysymF1 && keysym <= XkbKeysymF12)
+				return (Keys) ((int) Keys.F1 + (int) (keysym - XkbKeysymF1));
+			if (keysym >= XkbKeysymKp0 && keysym <= XkbKeysymKp9)
+				return (Keys) ((int) Keys.NumPad0 + (int) (keysym - XkbKeysymKp0));
 
 			switch (keysym) {
-			case 0xff1b: return Keys.Escape;
-			case 0xff08: return Keys.Back;
-			case 0xff09: return Keys.Tab;
-			case 0xff0d: return Keys.Return;
-			case 0xffff: return Keys.Delete;
-			case 0xff63: return Keys.Insert;
-			case 0xff50: return Keys.Home;
-			case 0xff57: return Keys.End;
-			case 0xff55: return Keys.PageUp;
-			case 0xff56: return Keys.PageDown;
-			case 0xff51: return Keys.Left;
-			case 0xff52: return Keys.Up;
-			case 0xff53: return Keys.Right;
-			case 0xff54: return Keys.Down;
-			case 0xffe1:
-			case 0xffe2: return Keys.ShiftKey;
-			case 0xffe3:
-			case 0xffe4: return Keys.ControlKey;
-			case 0xffe9:
-			case 0xffea: return Keys.Menu;
-			case 0xffeb: return Keys.LWin;
-			case 0xffec: return Keys.RWin;
-			case 0xffe5: return Keys.CapsLock;
-			case 0xff7f: return Keys.NumLock;
-			case 0xff14: return Keys.Scroll;
-			case 0xff8d: return Keys.Return;
-			case 0xffaa: return Keys.Multiply;
-			case 0xffab: return Keys.Add;
-			case 0xffad: return Keys.Subtract;
-			case 0xffae: return Keys.Decimal;
-			case 0xffaf: return Keys.Divide;
+			case XkbKeysymEscape: return Keys.Escape;
+			case XkbKeysymBackSpace: return Keys.Back;
+			case XkbKeysymTab: return Keys.Tab;
+			case XkbKeysymReturn: return Keys.Return;
+			case XkbKeysymDelete: return Keys.Delete;
+			case XkbKeysymInsert: return Keys.Insert;
+			case XkbKeysymHome: return Keys.Home;
+			case XkbKeysymEnd: return Keys.End;
+			case XkbKeysymPageUp: return Keys.PageUp;
+			case XkbKeysymPageDown: return Keys.PageDown;
+			case XkbKeysymLeft: return Keys.Left;
+			case XkbKeysymUp: return Keys.Up;
+			case XkbKeysymRight: return Keys.Right;
+			case XkbKeysymDown: return Keys.Down;
+			case XkbKeysymShiftL:
+			case XkbKeysymShiftR: return Keys.ShiftKey;
+			case XkbKeysymControlL:
+			case XkbKeysymControlR: return Keys.ControlKey;
+			case XkbKeysymAltL:
+			case XkbKeysymAltR: return Keys.Menu;
+			case XkbKeysymSuperL: return Keys.LWin;
+			case XkbKeysymSuperR: return Keys.RWin;
+			case XkbKeysymCapsLock: return Keys.CapsLock;
+			case XkbKeysymNumLock: return Keys.NumLock;
+			case XkbKeysymScrollLock: return Keys.Scroll;
+			case XkbKeysymKpEnter: return Keys.Return;
+			case XkbKeysymKpMultiply: return Keys.Multiply;
+			case XkbKeysymKpAdd: return Keys.Add;
+			case XkbKeysymKpSubtract: return Keys.Subtract;
+			case XkbKeysymKpDecimal: return Keys.Decimal;
+			case XkbKeysymKpDivide: return Keys.Divide;
 			case ' ': return Keys.Space;
 			case '-':
 			case '_': return Keys.OemMinus;
@@ -3854,7 +5727,7 @@ namespace System.Windows.Forms {
 			case 26: return Keys.OemOpenBrackets;
 			case 27: return Keys.OemCloseBrackets;
 			case 28: return Keys.Return;
-			case 29: return Keys.ControlKey;
+			case EvdevKeyLeftControl: return Keys.ControlKey;
 			case 30: return Keys.A;
 			case 31: return Keys.S;
 			case 32: return Keys.D;
@@ -3867,7 +5740,7 @@ namespace System.Windows.Forms {
 			case 39: return Keys.OemSemicolon;
 			case 40: return Keys.OemQuotes;
 			case 41: return Keys.Oemtilde;
-			case 42: return Keys.ShiftKey;
+			case EvdevKeyLeftShift: return Keys.ShiftKey;
 			case 43: return Keys.OemPipe;
 			case 44: return Keys.Z;
 			case 45: return Keys.X;
@@ -3879,9 +5752,9 @@ namespace System.Windows.Forms {
 			case 51: return Keys.Oemcomma;
 			case 52: return Keys.OemPeriod;
 			case 53: return Keys.OemQuestion;
-			case 54: return Keys.ShiftKey;
+			case EvdevKeyRightShift: return Keys.ShiftKey;
 			case 55: return Keys.Multiply;
-			case 56: return Keys.Menu;
+			case EvdevKeyLeftAlt: return Keys.Menu;
 			case 57: return Keys.Space;
 			case 58: return Keys.CapsLock;
 			case 59: return Keys.F1;
@@ -3913,9 +5786,9 @@ namespace System.Windows.Forms {
 			case 87: return Keys.F11;
 			case 88: return Keys.F12;
 			case 96: return Keys.Return;
-			case 97: return Keys.ControlKey;
+			case EvdevKeyRightControl: return Keys.ControlKey;
 			case 98: return Keys.Divide;
-			case 100: return Keys.Menu;
+			case EvdevKeyRightAlt: return Keys.RMenu;
 			case 102: return Keys.Home;
 			case 103: return Keys.Up;
 			case 104: return Keys.PageUp;
