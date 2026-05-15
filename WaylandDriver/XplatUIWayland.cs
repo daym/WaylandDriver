@@ -15,8 +15,10 @@ namespace System.Windows.Forms {
 			public Bitmap BackBuffer;
 			public int BufferScale = 1;
 			public uint SurfaceId;
+			public uint SubsurfaceId;
 			public uint XdgSurfaceId;
 			public uint XdgToplevelId;
+			public bool XdgConfigured;
 			public readonly List<WaylandShmBuffer> Buffers = new List<WaylandShmBuffer> ();
 			public readonly HashSet<uint> EnteredOutputs = new HashSet<uint> ();
 
@@ -56,10 +58,12 @@ namespace System.Windows.Forms {
 		readonly Dictionary<uint, WaylandOutput> waylandOutputs = new Dictionary<uint, WaylandOutput> ();
 		readonly List<IntPtr> zOrder = new List<IntPtr> ();
 		readonly List<Timer> timers = new List<Timer> ();
+		readonly Bitmap fallbackBitmap = new Bitmap (1, 1, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
 
 		WaylandConnection connection;
 		WaylandRegistry registry;
 		uint compositorId;
+		uint subcompositorId;
 		uint shmId;
 		uint xdgWmBaseId;
 		int nextHandle = 0x4000;
@@ -162,12 +166,15 @@ namespace System.Windows.Forms {
 			connection = WaylandConnection.ConnectFromEnvironment ();
 			registry = connection.GetRegistryRoundtrip ();
 			compositorId = connection.Bind (registry, "wl_compositor", 4);
+			subcompositorId = connection.Bind (registry, "wl_subcompositor", 1);
 			shmId = connection.Bind (registry, "wl_shm", 1);
 			xdgWmBaseId = connection.Bind (registry, "xdg_wm_base", 3);
 			BindOutputs ();
 
 			if (compositorId == 0)
 				throw new InvalidOperationException ("The Wayland compositor did not advertise wl_compositor.");
+			if (subcompositorId == 0)
+				throw new InvalidOperationException ("The Wayland compositor did not advertise wl_subcompositor.");
 			if (shmId == 0)
 				throw new InvalidOperationException ("The Wayland compositor did not advertise wl_shm.");
 			if (xdgWmBaseId == 0)
@@ -182,6 +189,7 @@ namespace System.Windows.Forms {
 				window.Dispose ();
 			foreach (WaylandShmBuffer buffer in waylandBuffers.Values)
 				buffer.Dispose ();
+			fallbackBitmap.Dispose ();
 			windows.Clear ();
 			waylandObjects.Clear ();
 			waylandBuffers.Clear ();
@@ -233,6 +241,7 @@ namespace System.Windows.Forms {
 			hwnd.Parent = parent;
 			hwnd.initial_style = cp.WindowStyle;
 			hwnd.initial_ex_style = cp.WindowExStyle;
+			hwnd.ClientRect = hwnd.GetClientRectangle (width, height);
 			hwnd.visible = false;
 			hwnd.enabled = !StyleSet (cp.Style, WindowStyles.WS_DISABLED);
 			SetHwndStyles (hwnd, cp);
@@ -281,6 +290,7 @@ namespace System.Windows.Forms {
 			if (!windows.TryGetValue (handle, out window))
 				return;
 
+			DestroyChildNativeWindows (window);
 			DestroyNativeWindow (window);
 			SendMessage (handle, Msg.WM_DESTROY, IntPtr.Zero, IntPtr.Zero);
 			SendParentNotify (handle, Msg.WM_DESTROY, Int32.MaxValue, Int32.MaxValue);
@@ -422,8 +432,12 @@ namespace System.Windows.Forms {
 
 			if (visible) {
 				EnsureNativeWindow (window);
-				if (activate)
+				if (IsSubsurfaceWindow (window))
+					Invalidate (handle, Rectangle.Empty, false);
+				if (activate && !IsSubsurfaceWindow (window))
 					Activate (handle);
+			} else {
+				UnmapNativeWindow (window);
 			}
 
 			PostMessage (handle, Msg.WM_SHOWWINDOW, visible ? (IntPtr) 1 : IntPtr.Zero, IntPtr.Zero);
@@ -449,7 +463,16 @@ namespace System.Windows.Forms {
 				return IntPtr.Zero;
 
 			IntPtr old = window.Hwnd.Parent == null ? IntPtr.Zero : window.Hwnd.Parent.Handle;
+			Hwnd oldParent = window.Hwnd.Parent;
 			window.Hwnd.Parent = parent == IntPtr.Zero ? null : Hwnd.ObjectFromHandle (parent);
+
+			if (oldParent != window.Hwnd.Parent && window.SurfaceId != 0)
+				DestroyNativeWindow (window);
+			if (window.Hwnd.visible) {
+				EnsureNativeWindow (window);
+				Invalidate (handle, Rectangle.Empty, false);
+			}
+
 			return old;
 		}
 
@@ -472,8 +495,7 @@ namespace System.Windows.Forms {
 		{
 			WaylandWindow window;
 			if (!windows.TryGetValue (handle, out window)) {
-				Bitmap fallback = new Bitmap (1, 1);
-				return new PaintEventArgs (Graphics.FromImage (fallback), new Rectangle (0, 0, 1, 1));
+				return new PaintEventArgs (Graphics.FromImage (fallbackBitmap), new Rectangle (0, 0, 1, 1));
 			}
 
 			window.EnsureBackBuffer ();
@@ -495,7 +517,14 @@ namespace System.Windows.Forms {
 				pevent.Dispose ();
 
 			WaylandWindow window;
-			if (windows.TryGetValue (handle, out window) && window.SurfaceId != 0) {
+			if (windows.TryGetValue (handle, out window)) {
+				if (window.SurfaceId == 0 && window.Hwnd.visible)
+					EnsureNativeWindow (window);
+				if (window.SurfaceId == 0)
+					return;
+				if (window.XdgSurfaceId != 0 && !window.XdgConfigured)
+					return;
+
 				window.EnsureBackBuffer ();
 				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (connection, shmId, window.BackBuffer, window.BufferScale);
 				window.Buffers.Add (buffer);
@@ -519,6 +548,16 @@ namespace System.Windows.Forms {
 			}
 		}
 
+		internal Graphics CreateGraphics (IntPtr handle)
+		{
+			WaylandWindow window;
+			if (!windows.TryGetValue (handle, out window))
+				return Graphics.FromImage (fallbackBitmap);
+
+			window.EnsureBackBuffer ();
+			return Graphics.FromImage (window.BackBuffer);
+		}
+
 		internal override void SetWindowPos (IntPtr handle, int x, int y, int width, int height)
 		{
 			WaylandWindow window;
@@ -530,6 +569,7 @@ namespace System.Windows.Forms {
 			window.Hwnd.Width = Math.Max (1, width);
 			window.Hwnd.Height = Math.Max (1, height);
 			window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (window.Hwnd.Width, window.Hwnd.Height);
+			UpdateSubsurfacePosition (window);
 			PostMessage (handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
 		}
 
@@ -691,6 +731,10 @@ namespace System.Windows.Forms {
 				int index = zOrder.IndexOf (afterHWnd);
 				zOrder.Insert (index < 0 ? zOrder.Count : index, hWnd);
 			}
+
+			WaylandWindow window;
+			if (windows.TryGetValue (hWnd, out window))
+				ApplySubsurfaceZOrder (window, afterHWnd, top, bottom);
 
 			return true;
 		}
@@ -1064,8 +1108,42 @@ namespace System.Windows.Forms {
 
 		void EnsureNativeWindow (WaylandWindow window)
 		{
-			if (window.SurfaceId != 0 || connection == null || window.Hwnd.Parent != null)
+			if (window.SurfaceId != 0 || connection == null)
 				return;
+
+			if (IsSubsurfaceWindow (window)) {
+				WaylandWindow parent = GetParentWindow (window);
+				if (parent == null)
+					return;
+
+				EnsureNativeWindow (parent);
+				if (parent.SurfaceId == 0)
+					return;
+
+				window.SurfaceId = connection.AllocateId ();
+				window.SubsurfaceId = connection.AllocateId ();
+				window.BufferScale = parent.BufferScale;
+
+				connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
+					b.WriteNewId (window.SurfaceId);
+				});
+				connection.SendRequest (subcompositorId, WaylandProtocol.WlSubcompositor.GetSubsurface, delegate (WaylandRequestBuilder b) {
+					b.WriteNewId (window.SubsurfaceId);
+					b.WriteObject (window.SurfaceId);
+					b.WriteObject (parent.SurfaceId);
+				});
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+					b.WriteInt32 (window.BufferScale);
+				});
+				UpdateSubsurfacePosition (window);
+				connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.SetDesync, null);
+				ApplySubsurfaceZOrder (window, IntPtr.Zero, true, false);
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+
+				waylandObjects [window.SurfaceId] = window;
+				waylandObjects [window.SubsurfaceId] = window;
+				return;
+			}
 
 			window.SurfaceId = connection.AllocateId ();
 			window.XdgSurfaceId = connection.AllocateId ();
@@ -1112,15 +1190,47 @@ namespace System.Windows.Forms {
 				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.Destroy, null);
 			if (window.XdgSurfaceId != 0)
 				connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.Destroy, null);
+			if (window.SubsurfaceId != 0)
+				connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.Destroy, null);
 			if (window.SurfaceId != 0)
 				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Destroy, null);
 
 			waylandObjects.Remove (window.SurfaceId);
+			waylandObjects.Remove (window.SubsurfaceId);
 			waylandObjects.Remove (window.XdgSurfaceId);
 			waylandObjects.Remove (window.XdgToplevelId);
 			window.SurfaceId = 0;
+			window.SubsurfaceId = 0;
 			window.XdgSurfaceId = 0;
 			window.XdgToplevelId = 0;
+			window.XdgConfigured = false;
+		}
+
+		void UnmapNativeWindow (WaylandWindow window)
+		{
+			if (connection == null || window.SurfaceId == 0)
+				return;
+
+			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
+				b.WriteObject (0);
+				b.WriteInt32 (0);
+				b.WriteInt32 (0);
+			});
+			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+		}
+
+		void DestroyChildNativeWindows (WaylandWindow parent)
+		{
+			List<WaylandWindow> children = new List<WaylandWindow> ();
+			foreach (WaylandWindow candidate in windows.Values) {
+				if (candidate.Hwnd.Parent == parent.Hwnd)
+					children.Add (candidate);
+			}
+
+			foreach (WaylandWindow child in children) {
+				DestroyChildNativeWindows (child);
+				DestroyNativeWindow (child);
+			}
 		}
 
 		void DispatchWaylandPending (int timeoutMilliseconds)
@@ -1193,13 +1303,22 @@ namespace System.Windows.Forms {
 				connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.AckConfigure, delegate (WaylandRequestBuilder b) {
 					b.WriteUInt32 (serial);
 				});
+				window.XdgConfigured = true;
 				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
 				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
 				return;
 			}
 
-			if (message.ObjectId == window.XdgToplevelId && message.Opcode == WaylandProtocol.XdgToplevel.Close) {
-				PostMessage (window.Hwnd.Handle, Msg.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+			if (message.ObjectId == window.XdgToplevelId) {
+				if (message.Opcode == WaylandProtocol.XdgToplevel.Configure) {
+					HandleToplevelConfigure (window, message);
+					return;
+				}
+
+				if (message.Opcode == WaylandProtocol.XdgToplevel.Close) {
+					PostMessage (window.Hwnd.Handle, Msg.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+					return;
+				}
 			}
 		}
 
@@ -1238,12 +1357,7 @@ namespace System.Windows.Forms {
 
 		void UpdateWindowScale (WaylandWindow window)
 		{
-			int scale = 1;
-			foreach (uint outputId in window.EnteredOutputs) {
-				WaylandOutput output;
-				if (waylandOutputs.TryGetValue (outputId, out output))
-					scale = Math.Max (scale, output.Scale);
-			}
+			int scale = GetTargetScale (window);
 
 			if (scale == window.BufferScale)
 				return;
@@ -1255,6 +1369,99 @@ namespace System.Windows.Forms {
 				});
 				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
 			}
+
+			foreach (WaylandWindow child in windows.Values) {
+				if (child.Hwnd.Parent == window.Hwnd)
+					UpdateWindowScale (child);
+			}
+		}
+
+		int GetTargetScale (WaylandWindow window)
+		{
+			WaylandWindow parent = GetParentWindow (window);
+			if (parent != null)
+				return parent.BufferScale;
+
+			int scale = 1;
+			foreach (uint outputId in window.EnteredOutputs) {
+				WaylandOutput output;
+				if (waylandOutputs.TryGetValue (outputId, out output))
+					scale = Math.Max (scale, output.Scale);
+			}
+			return scale;
+		}
+
+		void HandleToplevelConfigure (WaylandWindow window, WaylandMessage message)
+		{
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+			int width = reader.ReadInt32 ();
+			int height = reader.ReadInt32 ();
+			if (!reader.End)
+				reader.ReadArray ();
+
+			if (width <= 0 || height <= 0)
+				return;
+			if (width == window.Hwnd.Width && height == window.Hwnd.Height)
+				return;
+
+			window.Hwnd.Width = width;
+			window.Hwnd.Height = height;
+			window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (width, height);
+			window.Dispose ();
+			PostMessage (window.Hwnd.Handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
+			Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
+		}
+
+		WaylandWindow GetParentWindow (WaylandWindow window)
+		{
+			if (window.Hwnd.Parent == null)
+				return null;
+
+			WaylandWindow parent;
+			return windows.TryGetValue (window.Hwnd.Parent.Handle, out parent) ? parent : null;
+		}
+
+		bool IsSubsurfaceWindow (WaylandWindow window)
+		{
+			return window.Hwnd.Parent != null || StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_CHILD);
+		}
+
+		void UpdateSubsurfacePosition (WaylandWindow window)
+		{
+			if (window.SubsurfaceId == 0)
+				return;
+
+			connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.SetPosition, delegate (WaylandRequestBuilder b) {
+				b.WriteInt32 (window.Hwnd.X);
+				b.WriteInt32 (window.Hwnd.Y);
+			});
+		}
+
+		void ApplySubsurfaceZOrder (WaylandWindow window, IntPtr afterHWnd, bool top, bool bottom)
+		{
+			if (window.SubsurfaceId == 0)
+				return;
+
+			WaylandWindow parent = GetParentWindow (window);
+			if (parent == null || parent.SurfaceId == 0)
+				return;
+
+			uint targetSurface = parent.SurfaceId;
+			WaylandWindow sibling;
+			if (!bottom && afterHWnd != IntPtr.Zero && windows.TryGetValue (afterHWnd, out sibling) && sibling.Hwnd.Parent == window.Hwnd.Parent && sibling.SurfaceId != 0)
+				targetSurface = sibling.SurfaceId;
+			else if (top) {
+				foreach (IntPtr handle in zOrder) {
+					if (handle == window.Hwnd.Handle)
+						continue;
+					if (windows.TryGetValue (handle, out sibling) && sibling.Hwnd.Parent == window.Hwnd.Parent && sibling.SurfaceId != 0)
+						targetSurface = sibling.SurfaceId;
+				}
+			}
+
+			connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.PlaceAbove, delegate (WaylandRequestBuilder b) {
+				b.WriteObject (targetSurface);
+			});
 		}
 
 		void CheckTimers (DateTime now)

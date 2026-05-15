@@ -23,6 +23,20 @@ namespace WaylandDriver.Wayland {
 			public const ushort CreateSurface = 0;
 		}
 
+		internal static class WlSubcompositor {
+			public const ushort Destroy = 0;
+			public const ushort GetSubsurface = 1;
+		}
+
+		internal static class WlSubsurface {
+			public const ushort Destroy = 0;
+			public const ushort SetPosition = 1;
+			public const ushort PlaceAbove = 2;
+			public const ushort PlaceBelow = 3;
+			public const ushort SetSync = 4;
+			public const ushort SetDesync = 5;
+		}
+
 		internal static class WlShm {
 			public const ushort CreatePool = 0;
 
