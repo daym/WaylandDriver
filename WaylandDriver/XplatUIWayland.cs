@@ -2,6 +2,8 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Threading;
 using WaylandDriver.Wayland;
@@ -35,6 +37,7 @@ namespace System.Windows.Forms {
 					BackBuffer.Dispose ();
 
 				BackBuffer = new Bitmap (width, height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+				BackBuffer.SetResolution (96.0f * Math.Max (1, BufferScale), 96.0f * Math.Max (1, BufferScale));
 			}
 
 			public void Dispose ()
@@ -1444,6 +1447,12 @@ namespace System.Windows.Forms {
 
 		static void ApplyLogicalScale (Graphics graphics, WaylandWindow window)
 		{
+			graphics.CompositingQuality = CompositingQuality.HighQuality;
+			graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+			graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+			graphics.SmoothingMode = SmoothingMode.AntiAlias;
+			graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
 			if (window.BufferScale != 1)
 				graphics.ScaleTransform (window.BufferScale, window.BufferScale);
 		}
