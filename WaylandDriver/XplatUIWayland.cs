@@ -13,9 +13,12 @@ namespace System.Windows.Forms {
 			public string Text;
 			public FormWindowState State;
 			public Bitmap BackBuffer;
+			public int BufferScale = 1;
 			public uint SurfaceId;
 			public uint XdgSurfaceId;
 			public uint XdgToplevelId;
+			public readonly List<WaylandShmBuffer> Buffers = new List<WaylandShmBuffer> ();
+			public readonly HashSet<uint> EnteredOutputs = new HashSet<uint> ();
 
 			public void EnsureBackBuffer ()
 			{
@@ -40,16 +43,24 @@ namespace System.Windows.Forms {
 			}
 		}
 
+		sealed class WaylandOutput {
+			public uint ObjectId;
+			public int Scale = 1;
+		}
+
 		readonly object queueLock = new object ();
 		readonly Queue messageQueue = new Queue ();
 		readonly Dictionary<IntPtr, WaylandWindow> windows = new Dictionary<IntPtr, WaylandWindow> ();
 		readonly Dictionary<uint, WaylandWindow> waylandObjects = new Dictionary<uint, WaylandWindow> ();
+		readonly Dictionary<uint, WaylandShmBuffer> waylandBuffers = new Dictionary<uint, WaylandShmBuffer> ();
+		readonly Dictionary<uint, WaylandOutput> waylandOutputs = new Dictionary<uint, WaylandOutput> ();
 		readonly List<IntPtr> zOrder = new List<IntPtr> ();
 		readonly List<Timer> timers = new List<Timer> ();
 
 		WaylandConnection connection;
 		WaylandRegistry registry;
 		uint compositorId;
+		uint shmId;
 		uint xdgWmBaseId;
 		int nextHandle = 0x4000;
 		IntPtr activeWindow = IntPtr.Zero;
@@ -146,10 +157,14 @@ namespace System.Windows.Forms {
 			connection = WaylandConnection.ConnectFromEnvironment ();
 			registry = connection.GetRegistryRoundtrip ();
 			compositorId = connection.Bind (registry, "wl_compositor", 4);
+			shmId = connection.Bind (registry, "wl_shm", 1);
 			xdgWmBaseId = connection.Bind (registry, "xdg_wm_base", 3);
+			BindOutputs ();
 
 			if (compositorId == 0)
 				throw new InvalidOperationException ("The Wayland compositor did not advertise wl_compositor.");
+			if (shmId == 0)
+				throw new InvalidOperationException ("The Wayland compositor did not advertise wl_shm.");
 			if (xdgWmBaseId == 0)
 				throw new InvalidOperationException ("The Wayland compositor did not advertise xdg_wm_base.");
 
@@ -160,8 +175,12 @@ namespace System.Windows.Forms {
 		{
 			foreach (WaylandWindow window in windows.Values)
 				window.Dispose ();
+			foreach (WaylandShmBuffer buffer in waylandBuffers.Values)
+				buffer.Dispose ();
 			windows.Clear ();
 			waylandObjects.Clear ();
+			waylandBuffers.Clear ();
+			waylandOutputs.Clear ();
 
 			if (connection != null)
 				connection.Dispose ();
@@ -288,11 +307,11 @@ namespace System.Windows.Forms {
 				return;
 
 			if (state == FormWindowState.Maximized) {
-				connection.SendRequest (window.XdgToplevelId, 9, null);
+				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMaximized, null);
 			} else if (state == FormWindowState.Minimized) {
-				connection.SendRequest (window.XdgToplevelId, 13, null);
+				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinimized, null);
 			} else {
-				connection.SendRequest (window.XdgToplevelId, 10, null);
+				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.UnsetMaximized, null);
 			}
 		}
 
@@ -302,11 +321,11 @@ namespace System.Windows.Forms {
 			if (!windows.TryGetValue (handle, out window) || window.XdgToplevelId == 0)
 				return;
 
-			connection.SendRequest (window.XdgToplevelId, 8, delegate (WaylandRequestBuilder b) {
+			connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinSize, delegate (WaylandRequestBuilder b) {
 				b.WriteInt32 (min.Width);
 				b.WriteInt32 (min.Height);
 			});
-			connection.SendRequest (window.XdgToplevelId, 7, delegate (WaylandRequestBuilder b) {
+			connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMaxSize, delegate (WaylandRequestBuilder b) {
 				b.WriteInt32 (max.Width);
 				b.WriteInt32 (max.Height);
 			});
@@ -380,7 +399,7 @@ namespace System.Windows.Forms {
 
 			window.Text = text ?? String.Empty;
 			if (window.XdgToplevelId != 0) {
-				connection.SendRequest (window.XdgToplevelId, 2, delegate (WaylandRequestBuilder b) {
+				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetTitle, delegate (WaylandRequestBuilder b) {
 					b.WriteString (window.Text);
 				});
 			}
@@ -472,8 +491,26 @@ namespace System.Windows.Forms {
 
 			WaylandWindow window;
 			if (windows.TryGetValue (handle, out window) && window.SurfaceId != 0) {
-				// Real wl_shm buffer attachment is the next implementation step.
-				connection.SendRequest (window.SurfaceId, 6, null);
+				window.EnsureBackBuffer ();
+				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (connection, shmId, window.BackBuffer, window.BufferScale);
+				window.Buffers.Add (buffer);
+				waylandBuffers [buffer.BufferId] = buffer;
+
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+					b.WriteInt32 (buffer.Scale);
+				});
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
+					b.WriteObject (buffer.BufferId);
+					b.WriteInt32 (0);
+					b.WriteInt32 (0);
+				});
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.DamageBuffer, delegate (WaylandRequestBuilder b) {
+					b.WriteInt32 (0);
+					b.WriteInt32 (0);
+					b.WriteInt32 (buffer.BufferWidth);
+					b.WriteInt32 (buffer.BufferHeight);
+				});
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
 			}
 		}
 
@@ -994,6 +1031,20 @@ namespace System.Windows.Forms {
 				idle (this, e);
 		}
 
+		void BindOutputs ()
+		{
+			foreach (WaylandGlobal global in registry.Globals) {
+				if (global.Interface != "wl_output")
+					continue;
+
+				uint objectId = connection.Bind (registry, global, 2);
+				waylandOutputs [objectId] = new WaylandOutput {
+					ObjectId = objectId,
+					Scale = 1,
+				};
+			}
+		}
+
 		void EnsureNativeWindow (WaylandWindow window)
 		{
 			if (window.SurfaceId != 0 || connection == null || window.Hwnd.Parent != null)
@@ -1003,23 +1054,26 @@ namespace System.Windows.Forms {
 			window.XdgSurfaceId = connection.AllocateId ();
 			window.XdgToplevelId = connection.AllocateId ();
 
-			connection.SendRequest (compositorId, 0, delegate (WaylandRequestBuilder b) {
+			connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.SurfaceId);
 			});
-			connection.SendRequest (xdgWmBaseId, 2, delegate (WaylandRequestBuilder b) {
+			connection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.GetXdgSurface, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.XdgSurfaceId);
 				b.WriteObject (window.SurfaceId);
 			});
-			connection.SendRequest (window.XdgSurfaceId, 1, delegate (WaylandRequestBuilder b) {
+			connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.GetToplevel, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.XdgToplevelId);
 			});
-			connection.SendRequest (window.XdgToplevelId, 2, delegate (WaylandRequestBuilder b) {
+			connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetTitle, delegate (WaylandRequestBuilder b) {
 				b.WriteString (window.Text);
 			});
-			connection.SendRequest (window.XdgToplevelId, 3, delegate (WaylandRequestBuilder b) {
+			connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetAppId, delegate (WaylandRequestBuilder b) {
 				b.WriteString ("mono-winforms");
 			});
-			connection.SendRequest (window.SurfaceId, 6, null);
+			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+				b.WriteInt32 (window.BufferScale);
+			});
+			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
 
 			waylandObjects [window.SurfaceId] = window;
 			waylandObjects [window.XdgSurfaceId] = window;
@@ -1031,12 +1085,18 @@ namespace System.Windows.Forms {
 			if (connection == null)
 				return;
 
+			foreach (WaylandShmBuffer buffer in window.Buffers) {
+				waylandBuffers.Remove (buffer.BufferId);
+				buffer.DestroyWaylandObject (connection);
+			}
+			window.Buffers.Clear ();
+
 			if (window.XdgToplevelId != 0)
-				connection.SendRequest (window.XdgToplevelId, 0, null);
+				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.Destroy, null);
 			if (window.XdgSurfaceId != 0)
-				connection.SendRequest (window.XdgSurfaceId, 0, null);
+				connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.Destroy, null);
 			if (window.SurfaceId != 0)
-				connection.SendRequest (window.SurfaceId, 0, null);
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Destroy, null);
 
 			waylandObjects.Remove (window.SurfaceId);
 			waylandObjects.Remove (window.XdgSurfaceId);
@@ -1065,7 +1125,7 @@ namespace System.Windows.Forms {
 		void HandleWaylandMessage (WaylandMessage message)
 		{
 			if (message.ObjectId == 1) {
-				if (message.Opcode == 0) {
+				if (message.Opcode == WaylandProtocol.WlDisplay.Error) {
 					WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
 					uint objectId = reader.ReadUInt32 ();
 					uint code = reader.ReadUInt32 ();
@@ -1075,12 +1135,29 @@ namespace System.Windows.Forms {
 				return;
 			}
 
-			if (message.ObjectId == xdgWmBaseId && message.Opcode == 0) {
+			if (message.ObjectId == xdgWmBaseId && message.Opcode == WaylandProtocol.XdgWmBase.Ping) {
 				WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
 				uint serial = reader.ReadUInt32 ();
-				connection.SendRequest (xdgWmBaseId, 3, delegate (WaylandRequestBuilder b) {
+				connection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.Pong, delegate (WaylandRequestBuilder b) {
 					b.WriteUInt32 (serial);
 				});
+				return;
+			}
+
+			WaylandOutput output;
+			if (waylandOutputs.TryGetValue (message.ObjectId, out output)) {
+				HandleOutputMessage (output, message);
+				return;
+			}
+
+			WaylandShmBuffer releasedBuffer;
+			if (waylandBuffers.TryGetValue (message.ObjectId, out releasedBuffer)) {
+				if (message.Opcode == WaylandProtocol.WlBuffer.Release) {
+					waylandBuffers.Remove (releasedBuffer.BufferId);
+					foreach (WaylandWindow candidate in windows.Values)
+						candidate.Buffers.Remove (releasedBuffer);
+					releasedBuffer.DestroyWaylandObject (connection);
+				}
 				return;
 			}
 
@@ -1088,18 +1165,78 @@ namespace System.Windows.Forms {
 			if (!waylandObjects.TryGetValue (message.ObjectId, out window))
 				return;
 
-			if (message.ObjectId == window.XdgSurfaceId && message.Opcode == 0) {
-				WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
-				uint serial = reader.ReadUInt32 ();
-				connection.SendRequest (window.XdgSurfaceId, 4, delegate (WaylandRequestBuilder b) {
-					b.WriteUInt32 (serial);
-				});
-				connection.SendRequest (window.SurfaceId, 6, null);
+			if (message.ObjectId == window.SurfaceId) {
+				HandleSurfaceMessage (window, message);
 				return;
 			}
 
-			if (message.ObjectId == window.XdgToplevelId && message.Opcode == 1) {
+			if (message.ObjectId == window.XdgSurfaceId && message.Opcode == WaylandProtocol.XdgSurface.Configure) {
+				WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+				uint serial = reader.ReadUInt32 ();
+				connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.AckConfigure, delegate (WaylandRequestBuilder b) {
+					b.WriteUInt32 (serial);
+				});
+				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+				return;
+			}
+
+			if (message.ObjectId == window.XdgToplevelId && message.Opcode == WaylandProtocol.XdgToplevel.Close) {
 				PostMessage (window.Hwnd.Handle, Msg.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+			}
+		}
+
+		void HandleOutputMessage (WaylandOutput output, WaylandMessage message)
+		{
+			if (message.Opcode != WaylandProtocol.WlOutput.Scale)
+				return;
+
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+			int scale = Math.Max (1, reader.ReadInt32 ());
+			if (scale == output.Scale)
+				return;
+
+			output.Scale = scale;
+			foreach (WaylandWindow window in windows.Values) {
+				if (window.EnteredOutputs.Contains (output.ObjectId))
+					UpdateWindowScale (window);
+			}
+		}
+
+		void HandleSurfaceMessage (WaylandWindow window, WaylandMessage message)
+		{
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+
+			if (message.Opcode == WaylandProtocol.WlSurface.Enter) {
+				window.EnteredOutputs.Add (reader.ReadUInt32 ());
+				UpdateWindowScale (window);
+				return;
+			}
+
+			if (message.Opcode == WaylandProtocol.WlSurface.Leave) {
+				window.EnteredOutputs.Remove (reader.ReadUInt32 ());
+				UpdateWindowScale (window);
+			}
+		}
+
+		void UpdateWindowScale (WaylandWindow window)
+		{
+			int scale = 1;
+			foreach (uint outputId in window.EnteredOutputs) {
+				WaylandOutput output;
+				if (waylandOutputs.TryGetValue (outputId, out output))
+					scale = Math.Max (scale, output.Scale);
+			}
+
+			if (scale == window.BufferScale)
+				return;
+
+			window.BufferScale = scale;
+			if (window.SurfaceId != 0) {
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+					b.WriteInt32 (window.BufferScale);
+				});
+				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
 			}
 		}
 

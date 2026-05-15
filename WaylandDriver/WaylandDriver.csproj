@@ -38,12 +38,14 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Wayland\WaylandConnection.cs" />
     <Compile Include="Wayland\WaylandMessage.cs" />
+    <Compile Include="Wayland\WaylandProtocol.cs" />
     <Compile Include="Wayland\WaylandRegistry.cs" />
+    <Compile Include="Wayland\WaylandShmBuffer.cs" />
     <Compile Include="XplatUIWayland.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <Target Name="CoreCompile" Inputs="@(Compile)" Outputs="$(IntermediateOutputPath)$(AssemblyName).dll">
     <MakeDir Directories="$(IntermediateOutputPath)" />
-    <Exec Command="mcs -target:library -out:&quot;$(IntermediateOutputPath)$(AssemblyName).dll&quot; -keyfile:&quot;$(AssemblyOriginatorKeyFile)&quot; -r:System -r:System.Core -r:System.Drawing -r:System.Windows.Forms -r:Mono.Posix @(Compile->'&quot;%(FullPath)&quot;', ' ')" />
+    <Exec Command="mcs -unsafe -target:library -out:&quot;$(IntermediateOutputPath)$(AssemblyName).dll&quot; -keyfile:&quot;$(AssemblyOriginatorKeyFile)&quot; -r:System -r:System.Core -r:System.Drawing -r:System.Windows.Forms -r:Mono.Posix @(Compile->'&quot;%(FullPath)&quot;', ' ')" />
   </Target>
 </Project>

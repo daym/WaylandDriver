@@ -33,7 +33,7 @@ namespace WaylandDriver.Wayland {
 		{
 			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
 
-			if (message.Opcode == 0) {
+			if (message.Opcode == WaylandProtocol.WlRegistry.Global) {
 				uint name = reader.ReadUInt32 ();
 				string iface = reader.ReadString ();
 				uint version = reader.ReadUInt32 ();
@@ -41,7 +41,7 @@ namespace WaylandDriver.Wayland {
 				return;
 			}
 
-			if (message.Opcode == 1) {
+			if (message.Opcode == WaylandProtocol.WlRegistry.GlobalRemove) {
 				uint name = reader.ReadUInt32 ();
 				for (int i = globals.Count - 1; i >= 0; i--) {
 					if (globals [i].Name == name)
@@ -63,4 +63,3 @@ namespace WaylandDriver.Wayland {
 		}
 	}
 }
-

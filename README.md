@@ -26,14 +26,16 @@ Implemented:
 - Pure C# Wayland socket connection using `System.Net.Sockets` and `Mono.Unix.UnixEndPoint`.
 - Wayland request/message encoding and decoding for normal non-fd messages.
 - `wl_display.get_registry`, registry global collection, and `wl_registry.bind`.
-- Basic binds for `wl_compositor` and `xdg_wm_base`.
+- Basic binds for `wl_compositor`, `wl_shm`, `wl_output`, and `xdg_wm_base`.
 - Basic `xdg_wm_base.ping` handling, `xdg_surface.configure` acking, and toplevel close to `WM_CLOSE`.
+- `wl_shm` buffer allocation, `SCM_RIGHTS` fd passing, mmap-backed ARGB buffers, attach, damage, and commit.
+- Native integer HiDPI scale tracking from `wl_output.scale` plus `wl_surface.enter/leave`; scale defaults to 1 until the compositor reports otherwise.
 - A mostly non-crashing `XplatUIDriver` scaffold with synthetic WinForms handles, timer/message queue support, window text/position/visibility state, and offscreen `System.Drawing` paint targets.
 
 Not implemented yet:
 
-- `wl_shm` buffer allocation and fd passing for real pixels on screen.
 - Input from `wl_seat`, keyboard maps, pointer grabs, cursors, clipboard/data-device, drag and drop, tray, real monitor geometry, and full window state negotiation.
-- Damage/commit from WinForms paint buffers to Wayland surfaces.
+- Fractional scaling/viewporter support; current HiDPI support is Wayland's integer `wl_surface.set_buffer_scale` path.
+- Buffer reuse; current painting creates a fresh shm buffer per commit and destroys it after compositor release.
 
-There are no custom C libraries and no dependency on `libwayland-client`. The first unavoidable low-level gap for a complete backend is passing shared-memory file descriptors for `wl_shm`; that can still be done from C# using Mono/POSIX APIs, but it is not part of this first scaffold.
+There are no custom C libraries and no dependency on `libwayland-client`. The low-level Wayland fd path is handled with Mono.Posix `sendmsg`, `CMSG_*`, `mmap`, and POSIX file APIs.

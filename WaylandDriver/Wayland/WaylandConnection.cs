@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Net.Sockets;
 using Mono.Unix;
+using Mono.Unix.Native;
 
 namespace WaylandDriver.Wayland {
 	internal sealed class WaylandConnection : IDisposable {
@@ -41,6 +42,49 @@ namespace WaylandDriver.Wayland {
 			}
 		}
 
+		public unsafe void SendRequestWithFd (uint objectId, ushort opcode, Action<WaylandRequestBuilder> build, int fd)
+		{
+			WaylandRequestBuilder builder = new WaylandRequestBuilder ();
+			if (build != null)
+				build (builder);
+
+			byte [] bytes = builder.ToArray (objectId, opcode);
+			byte [] control = new byte [checked ((int) Syscall.CMSG_SPACE (sizeof (int)))];
+			Msghdr message = new Msghdr {
+				msg_control = control,
+				msg_controllen = control.Length,
+			};
+			Cmsghdr header = new Cmsghdr {
+				cmsg_len = (long) Syscall.CMSG_LEN (sizeof (int)),
+				cmsg_level = UnixSocketProtocol.SOL_SOCKET,
+				cmsg_type = UnixSocketControlMessage.SCM_RIGHTS,
+			};
+
+			header.WriteToBuffer (message, 0);
+			long dataOffset = Syscall.CMSG_DATA (message, 0);
+			fixed (byte* controlPtr = message.msg_control) {
+				((int*) (controlPtr + dataOffset)) [0] = fd;
+			}
+
+			fixed (byte* bytesPtr = bytes) {
+				message.msg_iov = new [] {
+					new Iovec {
+						iov_base = (IntPtr) bytesPtr,
+						iov_len = (ulong) bytes.Length,
+					}
+				};
+				message.msg_iovlen = 1;
+
+				lock (writeLock) {
+					long written = Syscall.sendmsg (socket.Handle.ToInt32 (), message, 0);
+					if (written < 0)
+						UnixMarshal.ThrowExceptionForLastError ();
+					if (written != bytes.Length)
+						throw new IOException ("Wayland fd request was only partially written.");
+				}
+			}
+		}
+
 		public bool TryReadMessage (int timeoutMilliseconds, out WaylandMessage message)
 		{
 			message = null;
@@ -67,10 +111,10 @@ namespace WaylandDriver.Wayland {
 			uint callbackId = AllocateId ();
 			WaylandRegistry registry = new WaylandRegistry (registryId);
 
-			SendRequest (1, 1, delegate (WaylandRequestBuilder b) {
+			SendRequest (1, WaylandProtocol.WlDisplay.GetRegistry, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (registryId);
 			});
-			SendRequest (1, 0, delegate (WaylandRequestBuilder b) {
+			SendRequest (1, WaylandProtocol.WlDisplay.Sync, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (callbackId);
 			});
 
@@ -81,7 +125,7 @@ namespace WaylandDriver.Wayland {
 
 				if (message.ObjectId == registryId) {
 					registry.HandleEvent (message);
-				} else if (message.ObjectId == callbackId && message.Opcode == 0) {
+				} else if (message.ObjectId == callbackId && message.Opcode == WaylandProtocol.WlCallback.Done) {
 					done = true;
 				}
 			}
@@ -95,9 +139,14 @@ namespace WaylandDriver.Wayland {
 			if (global == null)
 				return 0;
 
+			return Bind (registry, global, maxVersion);
+		}
+
+		public uint Bind (WaylandRegistry registry, WaylandGlobal global, uint maxVersion)
+		{
 			uint version = Math.Min (global.Version, maxVersion);
 			uint objectId = AllocateId ();
-			SendRequest (registry.ObjectId, 0, delegate (WaylandRequestBuilder b) {
+			SendRequest (registry.ObjectId, WaylandProtocol.WlRegistry.Bind, delegate (WaylandRequestBuilder b) {
 				b.WriteUInt32 (global.Name);
 				b.WriteString (global.Interface);
 				b.WriteUInt32 (version);
@@ -149,4 +198,3 @@ namespace WaylandDriver.Wayland {
 		}
 	}
 }
-
