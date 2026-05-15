@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -79,6 +80,18 @@ namespace System.Windows.Forms {
 			public Bitmap Bitmap;
 			public int HotspotX;
 			public int HotspotY;
+		}
+
+		sealed class WaylandDataOffer {
+			public uint ObjectId;
+			public readonly List<string> MimeTypes = new List<string> ();
+		}
+
+		sealed class ClipboardSelection {
+			public readonly Dictionary<int, object> Data = new Dictionary<int, object> ();
+			public bool Dirty;
+			public bool OwnsSelection;
+			public uint SourceId;
 		}
 
 		// Mono's Control.DoubleBuffer uses XplatUI offscreen drawables.  These
@@ -249,6 +262,29 @@ namespace System.Windows.Forms {
 		const uint XkbKeysymHyperR = 0xffee;
 		const uint XkbKeysymDelete = 0xffff;
 		const uint XkbKeysymIsoLevel3Shift = 0xfe03;
+		const int ClipboardFormatText = 1;
+		const int ClipboardFormatBitmap = 2;
+		const int ClipboardFormatMetafilePict = 3;
+		const int ClipboardFormatSymbolicLink = 4;
+		const int ClipboardFormatDif = 5;
+		const int ClipboardFormatTiff = 6;
+		const int ClipboardFormatOemText = 7;
+		const int ClipboardFormatDib = 8;
+		const int ClipboardFormatPalette = 9;
+		const int ClipboardFormatPenData = 10;
+		const int ClipboardFormatRiff = 11;
+		const int ClipboardFormatWaveAudio = 12;
+		const int ClipboardFormatUnicodeText = 13;
+		const int ClipboardFormatEnhancedMetafile = 14;
+		const int ClipboardFormatFileDrop = 15;
+		const int ClipboardFormatLocale = 16;
+		const int ClipboardCustomFormatStart = 0xc000;
+		const string MimeTextUtf8 = "text/plain;charset=utf-8";
+		const string MimeTextPlain = "text/plain";
+		const string MimeHtml = "text/html";
+		const string MimeRtf = "text/rtf";
+		static readonly IntPtr ClipboardHandle = new IntPtr (1);
+		static readonly IntPtr PrimarySelectionHandle = new IntPtr (2);
 
 		sealed class PhysicalUsKeyboardLayout : IWaylandKeyboardLayout {
 			readonly HashSet<uint> keysDown = new HashSet<uint> ();
@@ -3047,6 +3083,11 @@ namespace System.Windows.Forms {
 		readonly Dictionary<uint, WaylandShmBuffer> waylandBuffers = new Dictionary<uint, WaylandShmBuffer> ();
 		readonly Dictionary<uint, WaylandOutput> waylandOutputs = new Dictionary<uint, WaylandOutput> ();
 		readonly Dictionary<IntPtr, WaylandCursor> cursors = new Dictionary<IntPtr, WaylandCursor> ();
+		readonly Dictionary<uint, WaylandDataOffer> dataOffers = new Dictionary<uint, WaylandDataOffer> ();
+		readonly Dictionary<uint, ClipboardSelection> dataSources = new Dictionary<uint, ClipboardSelection> ();
+		readonly Dictionary<string, int> clipboardFormatIds = new Dictionary<string, int> (StringComparer.Ordinal);
+		readonly ClipboardSelection clipboardSelection = new ClipboardSelection ();
+		readonly ClipboardSelection primarySelection = new ClipboardSelection ();
 		readonly List<IntPtr> zOrder = new List<IntPtr> ();
 		readonly List<Timer> timers = new List<Timer> ();
 		readonly Bitmap fallbackBitmap = new Bitmap (1, 1, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
@@ -3066,6 +3107,9 @@ namespace System.Windows.Forms {
 		uint seatId;
 		uint pointerId;
 		uint keyboardId;
+		uint dataDeviceManagerId;
+		uint dataDeviceId;
+		uint selectionOfferId;
 		uint cursorShapeManagerId;
 		uint cursorShapeDeviceId;
 		uint lastInputSerial;
@@ -3073,6 +3117,7 @@ namespace System.Windows.Forms {
 		uint cursorSurfaceId;
 		int nextHandle = 0x4000;
 		int nextCursorHandle = 0x800000;
+		int nextClipboardFormatId = ClipboardCustomFormatStart;
 		IntPtr activeWindow = IntPtr.Zero;
 		IntPtr focusWindow = IntPtr.Zero;
 		IntPtr grabWindow = IntPtr.Zero;
@@ -3210,6 +3255,7 @@ namespace System.Windows.Forms {
 			shmId = connection.Bind (registry, "wl_shm", 1);
 			xdgWmBaseId = connection.Bind (registry, "xdg_wm_base", 3);
 			seatId = connection.Bind (registry, "wl_seat", 5);
+			dataDeviceManagerId = connection.Bind (registry, "wl_data_device_manager", 3);
 			cursorShapeManagerId = connection.Bind (registry, "wp_cursor_shape_manager_v1", 1);
 			BindOutputs ();
 
@@ -3224,6 +3270,8 @@ namespace System.Windows.Forms {
 			// Input is optional at the protocol level.  A compositor without
 			// wl_seat can still render windows, but there is no native source for
 			// pointer or keyboard messages to feed into Mono's normal queue.
+			if (seatId != 0 && dataDeviceManagerId != 0)
+				CreateDataDevice ();
 
 			return (IntPtr) 1;
 		}
@@ -3238,6 +3286,8 @@ namespace System.Windows.Forms {
 			foreach (WaylandShmBuffer buffer in waylandBuffers.Values)
 				buffer.Dispose ();
 			if (closingConnection != null) {
+				DestroySelectionSource (closingConnection, clipboardSelection);
+				DestroySelectionSource (closingConnection, primarySelection);
 				if (cursorShapeDeviceId != 0)
 					closingConnection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.Destroy, null);
 				if (cursorShapeManagerId != 0)
@@ -3258,6 +3308,8 @@ namespace System.Windows.Forms {
 			waylandObjects.Clear ();
 			waylandBuffers.Clear ();
 			waylandOutputs.Clear ();
+			dataOffers.Clear ();
+			dataSources.Clear ();
 			cursors.Clear ();
 			evdevKeysDown.Clear ();
 			keyText.Clear ();
@@ -4301,30 +4353,521 @@ namespace System.Windows.Forms {
 
 		internal override void ClipboardClose (IntPtr handle)
 		{
+			ClipboardSelection selection = GetClipboardSelection (handle);
+			if (selection.Dirty)
+				PublishClipboardSelection (selection, handle == ClipboardHandle);
 		}
 
 		internal override IntPtr ClipboardOpen (bool primarySelection)
 		{
-			return IntPtr.Zero;
+			return primarySelection ? PrimarySelectionHandle : ClipboardHandle;
 		}
 
 		internal override int ClipboardGetID (IntPtr handle, string format)
 		{
-			return 0;
+			GetClipboardSelection (handle);
+
+			int id;
+			if (TryGetStandardClipboardFormatId (format, out id))
+				return id;
+
+			if (!clipboardFormatIds.TryGetValue (format, out id)) {
+				id = nextClipboardFormatId++;
+				clipboardFormatIds [format] = id;
+			}
+
+			return id;
 		}
 
 		internal override void ClipboardStore (IntPtr handle, object obj, int id, XplatUI.ObjectToClipboard converter, bool copy)
 		{
+			ClipboardSelection selection = GetClipboardSelection (handle);
+			if (obj == null) {
+				ClearClipboardSelection (selection, handle == ClipboardHandle);
+				return;
+			}
+
+			selection.Data [NormalizeClipboardFormatId (handle, id, obj)] = obj;
+			selection.OwnsSelection = true;
+			selection.Dirty = true;
 		}
 
 		internal override int [] ClipboardAvailableFormats (IntPtr handle)
 		{
-			return new int [0];
+			ClipboardSelection selection = GetClipboardSelection (handle);
+			if (selection.OwnsSelection && selection.Data.Count > 0) {
+				int [] formats = new int [selection.Data.Count];
+				selection.Data.Keys.CopyTo (formats, 0);
+				return formats;
+			}
+
+			WaylandDataOffer offer;
+			if (handle == ClipboardHandle && selectionOfferId != 0 && dataOffers.TryGetValue (selectionOfferId, out offer))
+				return GetFormatsForOffer (offer);
+
+			return null;
 		}
 
 		internal override object ClipboardRetrieve (IntPtr handle, int id, XplatUI.ClipboardToObject converter)
 		{
+			ClipboardSelection selection = GetClipboardSelection (handle);
+			object obj;
+			if (selection.OwnsSelection && selection.Data.TryGetValue (id, out obj))
+				return obj;
+
+			WaylandDataOffer offer;
+			if (handle == ClipboardHandle && selectionOfferId != 0 && dataOffers.TryGetValue (selectionOfferId, out offer))
+				return RetrieveFromOffer (offer, id);
+
 			return null;
+		}
+
+		void CreateDataDevice ()
+		{
+			dataDeviceId = connection.AllocateId ();
+			connection.SendRequest (dataDeviceManagerId, WaylandProtocol.WlDataDeviceManager.GetDataDevice, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (dataDeviceId);
+				b.WriteObject (seatId);
+			});
+		}
+
+		ClipboardSelection GetClipboardSelection (IntPtr handle)
+		{
+			if (handle == ClipboardHandle)
+				return clipboardSelection;
+			if (handle == PrimarySelectionHandle)
+				return primarySelection;
+			throw new ArgumentException ("handle is not a valid clipboard handle");
+		}
+
+		int NormalizeClipboardFormatId (IntPtr handle, int id, object obj)
+		{
+			if (id != -1)
+				return id;
+
+			if (obj is string)
+				return ClipboardGetID (handle, DataFormats.UnicodeText);
+			if (obj is Image)
+				return ClipboardGetID (handle, DataFormats.Dib);
+			return ClipboardGetID (handle, obj.GetType ().FullName);
+		}
+
+		bool TryGetStandardClipboardFormatId (string format, out int id)
+		{
+			if (format == DataFormats.Text) {
+				id = ClipboardFormatText;
+				return true;
+			}
+			if (format == DataFormats.Bitmap) {
+				id = ClipboardFormatBitmap;
+				return true;
+			}
+			if (format == DataFormats.MetafilePict) {
+				id = ClipboardFormatMetafilePict;
+				return true;
+			}
+			if (format == DataFormats.SymbolicLink) {
+				id = ClipboardFormatSymbolicLink;
+				return true;
+			}
+			if (format == DataFormats.Dif) {
+				id = ClipboardFormatDif;
+				return true;
+			}
+			if (format == DataFormats.Tiff) {
+				id = ClipboardFormatTiff;
+				return true;
+			}
+			if (format == DataFormats.OemText) {
+				id = ClipboardFormatOemText;
+				return true;
+			}
+			if (format == DataFormats.Dib) {
+				id = ClipboardFormatDib;
+				return true;
+			}
+			if (format == DataFormats.Palette) {
+				id = ClipboardFormatPalette;
+				return true;
+			}
+			if (format == DataFormats.PenData) {
+				id = ClipboardFormatPenData;
+				return true;
+			}
+			if (format == DataFormats.Riff) {
+				id = ClipboardFormatRiff;
+				return true;
+			}
+			if (format == DataFormats.WaveAudio) {
+				id = ClipboardFormatWaveAudio;
+				return true;
+			}
+			if (format == DataFormats.UnicodeText) {
+				id = ClipboardFormatUnicodeText;
+				return true;
+			}
+			if (format == DataFormats.EnhancedMetafile) {
+				id = ClipboardFormatEnhancedMetafile;
+				return true;
+			}
+			if (format == DataFormats.FileDrop) {
+				id = ClipboardFormatFileDrop;
+				return true;
+			}
+			if (format == DataFormats.Locale) {
+				id = ClipboardFormatLocale;
+				return true;
+			}
+
+			id = 0;
+			return false;
+		}
+
+		void ClearClipboardSelection (ClipboardSelection selection, bool waylandClipboard)
+		{
+			selection.Data.Clear ();
+			selection.Dirty = false;
+			selection.OwnsSelection = false;
+
+			if (!waylandClipboard)
+				return;
+
+			if (dataDeviceId == 0)
+				return;
+
+			WaylandConnection liveConnection = RequireConnection ();
+			DestroySelectionSource (liveConnection, selection);
+			if (lastInputSerial != 0) {
+				liveConnection.SendRequest (dataDeviceId, WaylandProtocol.WlDataDevice.SetSelection, delegate (WaylandRequestBuilder b) {
+					b.WriteObject (0);
+					b.WriteUInt32 (lastInputSerial);
+				});
+			}
+		}
+
+		void PublishClipboardSelection (ClipboardSelection selection, bool waylandClipboard)
+		{
+			selection.Dirty = false;
+			selection.OwnsSelection = selection.Data.Count > 0;
+			if (!waylandClipboard || !selection.OwnsSelection || dataDeviceId == 0)
+				return;
+
+			List<string> mimeTypes = GetMimeTypesForSelection (selection);
+			if (mimeTypes.Count == 0)
+				return;
+
+			// Wayland selection ownership is tied to the input serial that caused
+			// the copy.  Programmatic clipboard writes without such a serial still
+			// work through the local cache, but are not valid compositor selection
+			// claims.
+			if (lastInputSerial == 0)
+				return;
+
+			WaylandConnection liveConnection = RequireConnection ();
+			DestroySelectionSource (liveConnection, selection);
+
+			uint sourceId = liveConnection.AllocateId ();
+			liveConnection.SendRequest (dataDeviceManagerId, WaylandProtocol.WlDataDeviceManager.CreateDataSource, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (sourceId);
+			});
+			foreach (string mimeType in mimeTypes) {
+				liveConnection.SendRequest (sourceId, WaylandProtocol.WlDataSource.Offer, delegate (WaylandRequestBuilder b) {
+					b.WriteString (mimeType);
+				});
+			}
+			liveConnection.SendRequest (dataDeviceId, WaylandProtocol.WlDataDevice.SetSelection, delegate (WaylandRequestBuilder b) {
+				b.WriteObject (sourceId);
+				b.WriteUInt32 (lastInputSerial);
+			});
+
+			selection.SourceId = sourceId;
+			dataSources [sourceId] = selection;
+		}
+
+		void DestroySelectionSource (WaylandConnection liveConnection, ClipboardSelection selection)
+		{
+			if (selection.SourceId == 0)
+				return;
+
+			uint sourceId = selection.SourceId;
+			selection.SourceId = 0;
+			dataSources.Remove (sourceId);
+			liveConnection.SendRequest (sourceId, WaylandProtocol.WlDataSource.Destroy, null);
+		}
+
+		List<string> GetMimeTypesForSelection (ClipboardSelection selection)
+		{
+			List<string> mimeTypes = new List<string> ();
+			foreach (KeyValuePair<int, object> item in selection.Data)
+				AddMimeTypesForFormat (mimeTypes, item.Key, item.Value);
+			return mimeTypes;
+		}
+
+		void AddMimeTypesForFormat (List<string> mimeTypes, int id, object obj)
+		{
+			if (!(obj is string))
+				return;
+
+			switch (id) {
+			case ClipboardFormatText:
+			case ClipboardFormatUnicodeText:
+			case ClipboardFormatOemText:
+				AddUniqueMimeType (mimeTypes, MimeTextUtf8);
+				AddUniqueMimeType (mimeTypes, MimeTextPlain);
+				break;
+			default:
+				DataFormats.Format format = DataFormats.GetFormat (id);
+				if (format != null && format.Name == DataFormats.StringFormat) {
+					AddUniqueMimeType (mimeTypes, MimeTextUtf8);
+					AddUniqueMimeType (mimeTypes, MimeTextPlain);
+				} else if (format != null && format.Name == DataFormats.Html) {
+					AddUniqueMimeType (mimeTypes, MimeHtml);
+				} else if (format != null && format.Name == DataFormats.Rtf) {
+					AddUniqueMimeType (mimeTypes, MimeRtf);
+				}
+				break;
+			}
+		}
+
+		void AddUniqueMimeType (List<string> mimeTypes, string mimeType)
+		{
+			if (!mimeTypes.Contains (mimeType))
+				mimeTypes.Add (mimeType);
+		}
+
+		int [] GetFormatsForOffer (WaylandDataOffer offer)
+		{
+			List<int> formats = new List<int> ();
+			foreach (string mimeType in offer.MimeTypes) {
+				if (IsTextMimeType (mimeType)) {
+					AddUniqueFormat (formats, ClipboardFormatUnicodeText);
+					AddUniqueFormat (formats, ClipboardFormatText);
+				} else if (String.Equals (mimeType, MimeHtml, StringComparison.OrdinalIgnoreCase)) {
+					AddUniqueFormat (formats, DataFormats.GetFormat (DataFormats.Html).Id);
+				} else if (String.Equals (mimeType, MimeRtf, StringComparison.OrdinalIgnoreCase)) {
+					AddUniqueFormat (formats, DataFormats.GetFormat (DataFormats.Rtf).Id);
+				}
+			}
+
+			if (formats.Count == 0)
+				return null;
+			return formats.ToArray ();
+		}
+
+		void AddUniqueFormat (List<int> formats, int format)
+		{
+			if (!formats.Contains (format))
+				formats.Add (format);
+		}
+
+		object RetrieveFromOffer (WaylandDataOffer offer, int id)
+		{
+			string mimeType = ChooseMimeTypeForFormat (offer, id);
+			if (mimeType == null)
+				return null;
+
+			byte [] data = ReceiveOfferData (offer, mimeType);
+			if (data == null)
+				return null;
+
+			if (id == ClipboardFormatText || id == ClipboardFormatUnicodeText || IsKnownTextFormat (id))
+				return DecodeClipboardText (data);
+
+			return null;
+		}
+
+		bool IsKnownTextFormat (int id)
+		{
+			DataFormats.Format format = DataFormats.GetFormat (id);
+			return format != null && (format.Name == DataFormats.StringFormat || format.Name == DataFormats.Html || format.Name == DataFormats.Rtf);
+		}
+
+		string ChooseMimeTypeForFormat (WaylandDataOffer offer, int id)
+		{
+			DataFormats.Format format = DataFormats.GetFormat (id);
+			if (id == ClipboardFormatText || id == ClipboardFormatUnicodeText ||
+			    (format != null && format.Name == DataFormats.StringFormat))
+				return FindTextMimeType (offer);
+			if (format != null && format.Name == DataFormats.Html && OfferHasMimeType (offer, MimeHtml))
+				return MimeHtml;
+			if (format != null && format.Name == DataFormats.Rtf && OfferHasMimeType (offer, MimeRtf))
+				return MimeRtf;
+			return null;
+		}
+
+		string FindTextMimeType (WaylandDataOffer offer)
+		{
+			foreach (string mimeType in offer.MimeTypes) {
+				if (String.Equals (mimeType, MimeTextUtf8, StringComparison.OrdinalIgnoreCase))
+					return mimeType;
+			}
+			foreach (string mimeType in offer.MimeTypes) {
+				if (IsTextMimeType (mimeType))
+					return mimeType;
+			}
+			return null;
+		}
+
+		bool OfferHasMimeType (WaylandDataOffer offer, string expected)
+		{
+			foreach (string mimeType in offer.MimeTypes) {
+				if (String.Equals (mimeType, expected, StringComparison.OrdinalIgnoreCase))
+					return true;
+			}
+			return false;
+		}
+
+		bool IsTextMimeType (string mimeType)
+		{
+			return mimeType != null && mimeType.StartsWith (MimeTextPlain, StringComparison.OrdinalIgnoreCase);
+		}
+
+		byte [] ReceiveOfferData (WaylandDataOffer offer, string mimeType)
+		{
+			int [] pipeFds = new int [2];
+			if (Syscall.pipe (pipeFds) != 0)
+				UnixMarshal.ThrowExceptionForLastError ();
+
+			try {
+				RequireConnection ().SendRequestWithFd (offer.ObjectId, WaylandProtocol.WlDataOffer.Receive, delegate (WaylandRequestBuilder b) {
+					b.WriteString (mimeType);
+				}, pipeFds [1]);
+				Syscall.close (pipeFds [1]);
+				pipeFds [1] = -1;
+
+				byte [] data = ReadFdToEnd (pipeFds [0]);
+				pipeFds [0] = -1;
+				return data;
+			} finally {
+				if (pipeFds [0] != -1)
+					Syscall.close (pipeFds [0]);
+				if (pipeFds [1] != -1)
+					Syscall.close (pipeFds [1]);
+			}
+		}
+
+		byte [] ReadFdToEnd (int fd)
+		{
+			using (UnixStream stream = new UnixStream (fd)) {
+				MemoryStream memory = new MemoryStream ();
+				byte [] buffer = new byte [4096];
+				while (true) {
+					Pollfd [] pollFds = new Pollfd [1];
+					pollFds [0].fd = fd;
+					pollFds [0].events = PollEvents.POLLIN | PollEvents.POLLHUP | PollEvents.POLLERR;
+					int ready = Syscall.poll (pollFds, 1, 4000);
+					if (ready < 0)
+						UnixMarshal.ThrowExceptionForLastError ();
+					if (ready == 0)
+						throw new TimeoutException ("Timed out waiting for Wayland clipboard data.");
+
+					int read = stream.Read (buffer, 0, buffer.Length);
+					if (read == 0)
+						break;
+					memory.Write (buffer, 0, read);
+				}
+				return memory.ToArray ();
+			}
+		}
+
+		string DecodeClipboardText (byte [] data)
+		{
+			int length = data.Length;
+			if (length > 0 && data [length - 1] == 0)
+				length--;
+			return Encoding.UTF8.GetString (data, 0, length);
+		}
+
+		void HandleDataDeviceMessage (WaylandMessage message)
+		{
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+			switch (message.Opcode) {
+			case WaylandProtocol.WlDataDevice.DataOffer: {
+				uint offerId = reader.ReadUInt32 ();
+				WaylandDataOffer offer = new WaylandDataOffer ();
+				offer.ObjectId = offerId;
+				dataOffers [offerId] = offer;
+				break;
+			}
+			case WaylandProtocol.WlDataDevice.Selection:
+				selectionOfferId = reader.ReadUInt32 ();
+				if (selectionOfferId == 0 && clipboardSelection.SourceId == 0)
+					clipboardSelection.OwnsSelection = false;
+				break;
+			}
+		}
+
+		void HandleDataOfferMessage (WaylandDataOffer offer, WaylandMessage message)
+		{
+			if (message.Opcode != WaylandProtocol.WlDataOffer.Offer)
+				return;
+
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+			string mimeType = reader.ReadString ();
+			if (!offer.MimeTypes.Contains (mimeType))
+				offer.MimeTypes.Add (mimeType);
+		}
+
+		void HandleDataSourceMessage (ClipboardSelection selection, WaylandMessage message)
+		{
+			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+			switch (message.Opcode) {
+			case WaylandProtocol.WlDataSource.Target:
+				reader.ReadString ();
+				break;
+			case WaylandProtocol.WlDataSource.Send: {
+				string mimeType = reader.ReadString ();
+				int fd;
+				if (!RequireConnection ().TryTakeFd (out fd))
+					throw new InvalidOperationException ("Wayland data_source.send did not include a file descriptor.");
+				WriteSelectionData (selection, mimeType, fd);
+				break;
+			}
+			case WaylandProtocol.WlDataSource.Cancelled:
+				dataSources.Remove (message.ObjectId);
+				if (selection.SourceId == message.ObjectId) {
+					selection.SourceId = 0;
+					selection.OwnsSelection = false;
+				}
+				RequireConnection ().SendRequest (message.ObjectId, WaylandProtocol.WlDataSource.Destroy, null);
+				break;
+			}
+		}
+
+		void WriteSelectionData (ClipboardSelection selection, string mimeType, int fd)
+		{
+			byte [] data = GetSelectionData (selection, mimeType);
+			using (UnixStream stream = new UnixStream (fd)) {
+				if (data != null && data.Length > 0)
+					stream.Write (data, 0, data.Length);
+			}
+		}
+
+		byte [] GetSelectionData (ClipboardSelection selection, string mimeType)
+		{
+			object obj;
+			if (String.Equals (mimeType, MimeHtml, StringComparison.OrdinalIgnoreCase)) {
+				if (TryGetStoredClipboardObject (selection, DataFormats.GetFormat (DataFormats.Html).Id, out obj) && obj is string)
+					return Encoding.UTF8.GetBytes ((string) obj);
+			} else if (String.Equals (mimeType, MimeRtf, StringComparison.OrdinalIgnoreCase)) {
+				if (TryGetStoredClipboardObject (selection, DataFormats.GetFormat (DataFormats.Rtf).Id, out obj) && obj is string)
+					return Encoding.UTF8.GetBytes ((string) obj);
+			} else if (IsTextMimeType (mimeType)) {
+				if (TryGetStoredClipboardObject (selection, ClipboardFormatUnicodeText, out obj) ||
+				    TryGetStoredClipboardObject (selection, ClipboardFormatText, out obj) ||
+				    TryGetStoredClipboardObject (selection, ClipboardFormatOemText, out obj) ||
+				    TryGetStoredClipboardObject (selection, DataFormats.GetFormat (DataFormats.StringFormat).Id, out obj)) {
+					if (obj is string)
+						return Encoding.UTF8.GetBytes ((string) obj);
+				}
+			}
+
+			return null;
+		}
+
+		bool TryGetStoredClipboardObject (ClipboardSelection selection, int id, out object obj)
+		{
+			return selection.Data.TryGetValue (id, out obj);
 		}
 
 		internal override void DrawReversibleLine (Point start, Point end, Color backColor)
@@ -5435,6 +5978,23 @@ namespace System.Windows.Forms {
 
 			if (message.ObjectId == keyboardId) {
 				HandleKeyboardMessage (message);
+				return;
+			}
+
+			if (message.ObjectId == dataDeviceId) {
+				HandleDataDeviceMessage (message);
+				return;
+			}
+
+			WaylandDataOffer offer;
+			if (dataOffers.TryGetValue (message.ObjectId, out offer)) {
+				HandleDataOfferMessage (offer, message);
+				return;
+			}
+
+			ClipboardSelection dataSource;
+			if (dataSources.TryGetValue (message.ObjectId, out dataSource)) {
+				HandleDataSourceMessage (dataSource, message);
 				return;
 			}
 

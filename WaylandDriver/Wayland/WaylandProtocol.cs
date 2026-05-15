@@ -122,6 +122,35 @@ namespace WaylandDriver.Wayland {
 			public const uint KeyStatePressed = 1;
 		}
 
+		internal static class WlDataOffer {
+			public const ushort Accept = 0;
+			public const ushort Receive = 1;
+			public const ushort Destroy = 2;
+
+			public const ushort Offer = 0;
+		}
+
+		internal static class WlDataSource {
+			public const ushort Offer = 0;
+			public const ushort Destroy = 1;
+
+			public const ushort Target = 0;
+			public const ushort Send = 1;
+			public const ushort Cancelled = 2;
+		}
+
+		internal static class WlDataDevice {
+			public const ushort SetSelection = 1;
+
+			public const ushort DataOffer = 0;
+			public const ushort Selection = 5;
+		}
+
+		internal static class WlDataDeviceManager {
+			public const ushort CreateDataSource = 0;
+			public const ushort GetDataDevice = 1;
+		}
+
 		internal static class WpCursorShapeManagerV1 {
 			public const ushort Destroy = 0;
 			public const ushort GetPointer = 1;
