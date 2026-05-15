@@ -651,6 +651,9 @@ namespace System.Windows.Forms {
 			if (!windows.TryGetValue (handle, out window))
 				return;
 
+			int oldWidth = window.Hwnd.Width;
+			int oldHeight = window.Hwnd.Height;
+
 			window.Hwnd.X = x;
 			window.Hwnd.Y = y;
 			window.Hwnd.Width = Math.Max (1, width);
@@ -658,6 +661,13 @@ namespace System.Windows.Forms {
 			window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (window.Hwnd.Width, window.Hwnd.Height);
 			UpdateSubsurfacePosition (window);
 			PostMessage (handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
+
+			// A Wayland subsurface's visible extent is the last committed buffer
+			// size, not Mono's Hwnd bounds.  If a child grows without repainting,
+			// the compositor can keep showing the old narrower buffer even though
+			// WinForms layout has already changed the logical client size.
+			if (window.Hwnd.visible && (window.Hwnd.Width != oldWidth || window.Hwnd.Height != oldHeight))
+				Invalidate (handle, Rectangle.Empty, false);
 		}
 
 		internal override void GetWindowPos (IntPtr handle, bool isToplevel, out int x, out int y, out int width, out int height, out int clientWidth, out int clientHeight)
