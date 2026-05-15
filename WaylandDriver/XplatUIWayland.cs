@@ -22,6 +22,7 @@ namespace System.Windows.Forms {
 			public uint XdgToplevelId;
 			public uint XdgPopupId;
 			public bool XdgConfigured;
+			public bool BufferAttached;
 			public readonly List<WaylandShmBuffer> Buffers = new List<WaylandShmBuffer> ();
 			public readonly HashSet<uint> EnteredOutputs = new HashSet<uint> ();
 
@@ -583,11 +584,15 @@ namespace System.Windows.Forms {
 			window.Hwnd.mapped = visible;
 
 			if (visible) {
-				EnsureNativeWindow (window);
-				if (IsSubsurfaceWindow (window))
-					Invalidate (handle, Rectangle.Empty, false);
-				if (activate && !IsSubsurfaceWindow (window) && !IsPopupWindow (window))
-					Activate (handle);
+				if (!ShouldDeferUnownedPopup (window)) {
+					EnsureNativeWindow (window);
+					if (IsSubsurfaceWindow (window))
+						Invalidate (handle, Rectangle.Empty, false);
+					else if (IsPopupWindow (window))
+						InvalidateWindowTree (window);
+					if (activate && !IsSubsurfaceWindow (window) && !IsPopupWindow (window))
+						Activate (handle);
+				}
 			} else {
 				if (IsPopupWindow (window)) {
 					// xdg_popup is a transient interaction role, not just a
@@ -985,8 +990,16 @@ namespace System.Windows.Forms {
 				DestroyNativeWindow (window);
 				if (window.Hwnd.visible) {
 					EnsureNativeWindow (window);
-					Invalidate (hWnd, Rectangle.Empty, false);
+					InvalidateWindowTree (window);
 				}
+			} else if (isPopup && window.Hwnd.visible && window.SurfaceId == 0) {
+				// ComboBox.ComboListBox calls Show before XplatUI.SetOwner.
+				// Wayland roles are immutable, so SetVisible deliberately
+				// deferred creating an unowned non-Form WS_POPUP surface.  Now
+				// that Mono has supplied the owner, create it directly as the
+				// xdg_popup it should have been from the start.
+				EnsureNativeWindow (window);
+				InvalidateWindowTree (window);
 			}
 			return true;
 		}
