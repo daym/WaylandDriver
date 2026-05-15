@@ -38,6 +38,9 @@ namespace WaylandDriver.Wayland {
 			if (scale < 1)
 				scale = 1;
 
+			// The source bitmap already contains physical buffer pixels.  Scale
+			// only describes how those pixels map to the logical wl_surface size;
+			// do not resample here or HiDPI output becomes blurry.
 			int bufferWidth = Math.Max (1, bitmap.Width);
 			int bufferHeight = Math.Max (1, bitmap.Height);
 			int logicalWidth = Math.Max (1, (bufferWidth + scale - 1) / scale);

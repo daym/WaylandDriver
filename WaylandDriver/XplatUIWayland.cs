@@ -27,6 +27,9 @@ namespace System.Windows.Forms {
 			public void EnsureBackBuffer ()
 			{
 				Rectangle client = Hwnd.ClientRect;
+				// WinForms keeps using logical pixels.  The backing bitmap is in
+				// Wayland buffer pixels; ApplyLogicalScale maps logical drawing
+				// into this larger physical bitmap for HiDPI outputs.
 				int width = checked (Math.Max (1, client.Width) * Math.Max (1, BufferScale));
 				int height = checked (Math.Max (1, client.Height) * Math.Max (1, BufferScale));
 
@@ -53,6 +56,9 @@ namespace System.Windows.Forms {
 			public int Scale = 1;
 		}
 
+		// Mono's Control.DoubleBuffer uses XplatUI offscreen drawables.  These
+		// must be scaled the same way as real surfaces or double-buffered labels,
+		// buttons, etc. paint into 1x bitmaps and get enlarged later.
 		sealed class WaylandOffscreenDrawable : IDisposable {
 			public readonly IntPtr Handle;
 			public readonly int LogicalWidth;
@@ -551,6 +557,8 @@ namespace System.Windows.Forms {
 			window.Hwnd.expose_pending = false;
 
 			Graphics graphics = Graphics.FromImage (window.BackBuffer);
+			// The PaintEventArgs clip remains logical.  Only the Graphics target
+			// is scaled, so control layout and paint code see normal WinForms units.
 			ApplyLogicalScale (graphics, window);
 			graphics.SetClip (clip);
 			return new PaintEventArgs (graphics, clip);
@@ -575,6 +583,9 @@ namespace System.Windows.Forms {
 				window.Buffers.Add (buffer);
 				waylandBuffers [buffer.BufferId] = buffer;
 
+				// wl_surface.damage_buffer is in physical buffer pixels.  The
+				// buffer scale tells the compositor how those pixels map back to
+				// the surface's logical size.
 				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
 					b.WriteInt32 (buffer.Scale);
 				});
@@ -623,6 +634,8 @@ namespace System.Windows.Forms {
 			WaylandOffscreenDrawable drawable = (WaylandOffscreenDrawable) offscreen_drawable;
 			drawable.EnsureBitmap (GetTargetScale (drawable.Handle));
 			Graphics graphics = Graphics.FromImage (drawable.Bitmap);
+			// Mono paints into offscreen drawables with logical coordinates too.
+			// Keep that coordinate system and only increase backing pixels.
 			ApplyLogicalScale (graphics, drawable.Scale);
 			return graphics;
 		}
@@ -634,6 +647,8 @@ namespace System.Windows.Forms {
 			if (dest.Width <= 0 || dest.Height <= 0)
 				return;
 
+			// The destination rectangle is still logical WinForms space, but the
+			// offscreen bitmap stores physical pixels.
 			Rectangle source = new Rectangle (dest.X * drawable.Scale, dest.Y * drawable.Scale, dest.Width * drawable.Scale, dest.Height * drawable.Scale);
 			InterpolationMode oldInterpolation = dest_dc.InterpolationMode;
 
@@ -1208,6 +1223,9 @@ namespace System.Windows.Forms {
 			if (window.SurfaceId != 0 || connection == null)
 				return;
 
+			// WinForms child HWNDs are native child windows, not independent
+			// desktop windows.  Model them as subsurfaces attached to the parent
+			// surface; only root/form windows get xdg_toplevel roles.
 			if (IsSubsurfaceWindow (window)) {
 				WaylandWindow parent = GetParentWindow (window);
 				if (parent == null)
@@ -1219,6 +1237,8 @@ namespace System.Windows.Forms {
 
 				window.SurfaceId = connection.AllocateId ();
 				window.SubsurfaceId = connection.AllocateId ();
+				// Parent and child must share one logical coordinate system.
+				// Scaling only changes buffer density, never child bounds.
 				window.BufferScale = parent.BufferScale;
 
 				connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
@@ -1233,6 +1253,8 @@ namespace System.Windows.Forms {
 					b.WriteInt32 (window.BufferScale);
 				});
 				UpdateSubsurfacePosition (window);
+				// Mono paints HWNDs independently.  Desync lets a child commit its
+				// new buffer without waiting for an explicit parent commit.
 				connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.SetDesync, null);
 				ApplySubsurfaceZOrder (window, IntPtr.Zero, true, false);
 				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
@@ -1476,6 +1498,8 @@ namespace System.Windows.Forms {
 		int GetTargetScale (WaylandWindow window)
 		{
 			WaylandWindow parent = GetParentWindow (window);
+			// Child scale follows the parent so SetPosition and WinForms layout
+			// remain in the same logical coordinate space across all child HWNDs.
 			if (parent != null)
 				return parent.BufferScale;
 
@@ -1547,6 +1571,8 @@ namespace System.Windows.Forms {
 
 		static void ApplyLogicalScale (Graphics graphics, int scale)
 		{
+			// This is the HiDPI boundary: controls still paint in logical pixels;
+			// the transform only maps those logical pixels to a denser buffer.
 			graphics.CompositingQuality = CompositingQuality.HighQuality;
 			graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
 			graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
@@ -1566,6 +1592,9 @@ namespace System.Windows.Forms {
 			if (parent == null || parent.SurfaceId == 0)
 				return;
 
+			// wl_subsurface.place_above wants a Wayland surface object.  The
+			// parent surface is the bottom reference; otherwise translate Mono's
+			// sibling HWND ordering to sibling surface ids.
 			uint targetSurface = parent.SurfaceId;
 			WaylandWindow sibling;
 			if (!bottom && afterHWnd != IntPtr.Zero && windows.TryGetValue (afterHWnd, out sibling) && sibling.Hwnd.Parent == window.Hwnd.Parent && sibling.SurfaceId != 0)
