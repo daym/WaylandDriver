@@ -280,6 +280,10 @@ namespace System.Windows.Forms {
 			foreach (WaylandShmBuffer buffer in waylandBuffers.Values)
 				buffer.Dispose ();
 			fallbackBitmap.Dispose ();
+			if (caret.Timer != null)
+				caret.Timer.Dispose ();
+			caret.Timer = null;
+			caret.Hwnd = IntPtr.Zero;
 			windows.Clear ();
 			waylandObjects.Clear ();
 			waylandBuffers.Clear ();
@@ -383,6 +387,7 @@ namespace System.Windows.Forms {
 				return;
 
 			DestroyChildNativeWindows (window);
+			DestroyCaret (handle);
 			DestroyNativeWindow (window);
 			SendMessage (handle, Msg.WM_DESTROY, IntPtr.Zero, IntPtr.Zero);
 			SendParentNotify (handle, Msg.WM_DESTROY, Int32.MaxValue, Int32.MaxValue);
@@ -635,29 +640,7 @@ namespace System.Windows.Forms {
 				if (window.XdgSurfaceId != 0 && !window.XdgConfigured)
 					return;
 
-				window.EnsureBackBuffer ();
-				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (connection, shmId, window.BackBuffer, window.BufferScale);
-				window.Buffers.Add (buffer);
-				waylandBuffers [buffer.BufferId] = buffer;
-
-				// wl_surface.damage_buffer is in physical buffer pixels.  The
-				// buffer scale tells the compositor how those pixels map back to
-				// the surface's logical size.
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
-					b.WriteInt32 (buffer.Scale);
-				});
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
-					b.WriteObject (buffer.BufferId);
-					b.WriteInt32 (0);
-					b.WriteInt32 (0);
-				});
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.DamageBuffer, delegate (WaylandRequestBuilder b) {
-					b.WriteInt32 (0);
-					b.WriteInt32 (0);
-					b.WriteInt32 (buffer.BufferWidth);
-					b.WriteInt32 (buffer.BufferHeight);
-				});
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+				CommitWindowBuffer (window);
 			}
 		}
 
@@ -1102,18 +1085,77 @@ namespace System.Windows.Forms {
 
 		internal override void CreateCaret (IntPtr hwnd, int width, int height)
 		{
+			if (!windows.ContainsKey (hwnd))
+				return;
+
+			bool wasVisible = caret.Hwnd == hwnd && caret.Visible;
+			bool wasOn = caret.Hwnd == hwnd && caret.On;
+			if (caret.Hwnd != IntPtr.Zero && caret.Hwnd != hwnd)
+				DestroyCaret (caret.Hwnd);
+
+			EnsureCaretTimer ();
+			caret.Hwnd = hwnd;
+			caret.Width = Math.Max (1, width);
+			caret.Height = Math.Max (1, height);
+			caret.Visible = wasVisible;
+			caret.On = wasVisible && wasOn;
+			if (caret.Visible) {
+				if (caret.On)
+					CommitCaretWindow (hwnd);
+				caret.Timer.Start ();
+			}
 		}
 
 		internal override void DestroyCaret (IntPtr hwnd)
 		{
+			if (caret.Hwnd != hwnd)
+				return;
+
+			bool needsCommit = caret.On;
+			if (caret.Timer != null)
+				caret.Timer.Stop ();
+			caret.Visible = false;
+			caret.On = false;
+			caret.Hwnd = IntPtr.Zero;
+			if (needsCommit)
+				CommitCaretWindow (hwnd);
 		}
 
 		internal override void SetCaretPos (IntPtr hwnd, int x, int y)
 		{
+			if (caret.Hwnd != hwnd)
+				return;
+
+			caret.X = x;
+			caret.Y = y;
+			if (caret.Visible) {
+				caret.On = true;
+				CommitCaretWindow (hwnd);
+				if (caret.Timer != null)
+					caret.Timer.Start ();
+			}
 		}
 
 		internal override void CaretVisible (IntPtr hwnd, bool visible)
 		{
+			if (caret.Hwnd != hwnd)
+				return;
+
+			if (visible) {
+				EnsureCaretTimer ();
+				caret.Visible = true;
+				caret.On = true;
+				CommitCaretWindow (hwnd);
+				caret.Timer.Start ();
+			} else {
+				if (caret.Timer != null)
+					caret.Timer.Stop ();
+				bool needsCommit = caret.On;
+				caret.Visible = false;
+				caret.On = false;
+				if (needsCommit)
+					CommitCaretWindow (hwnd);
+			}
 		}
 
 		internal override IntPtr GetFocus ()
@@ -1479,6 +1521,110 @@ namespace System.Windows.Forms {
 			waylandObjects [window.SurfaceId] = window;
 			waylandObjects [window.XdgSurfaceId] = window;
 			waylandObjects [window.XdgPopupId] = window;
+		}
+
+		void CommitWindowBuffer (WaylandWindow window)
+		{
+			if (connection == null || window.SurfaceId == 0)
+				return;
+			if (window.XdgSurfaceId != 0 && !window.XdgConfigured)
+				return;
+
+			window.EnsureBackBuffer ();
+			Bitmap commitBitmap = window.BackBuffer;
+			Bitmap caretBitmap = null;
+
+			try {
+				if (caret.Hwnd == window.Hwnd.Handle && caret.Visible && caret.On) {
+					// The caret is driver-owned state, not part of the control's
+					// painting.  Draw it onto a temporary commit bitmap so blink
+					// toggles never corrupt the pristine WinForms backing store.
+					caretBitmap = new Bitmap (window.BackBuffer);
+					DrawCaretOverlay (window, caretBitmap);
+					commitBitmap = caretBitmap;
+				}
+
+				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (connection, shmId, commitBitmap, window.BufferScale);
+				window.Buffers.Add (buffer);
+				waylandBuffers [buffer.BufferId] = buffer;
+
+				// wl_surface.damage_buffer is in physical buffer pixels.  The
+				// buffer scale tells the compositor how those pixels map back to
+				// the surface's logical size.
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+					b.WriteInt32 (buffer.Scale);
+				});
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
+					b.WriteObject (buffer.BufferId);
+					b.WriteInt32 (0);
+					b.WriteInt32 (0);
+				});
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.DamageBuffer, delegate (WaylandRequestBuilder b) {
+					b.WriteInt32 (0);
+					b.WriteInt32 (0);
+					b.WriteInt32 (buffer.BufferWidth);
+					b.WriteInt32 (buffer.BufferHeight);
+				});
+				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+			} finally {
+				if (caretBitmap != null)
+					caretBitmap.Dispose ();
+			}
+		}
+
+		void DrawCaretOverlay (WaylandWindow window, Bitmap bitmap)
+		{
+			int scale = Math.Max (1, window.BufferScale);
+			Rectangle rect = new Rectangle (
+				caret.X * scale,
+				caret.Y * scale,
+				Math.Max (1, caret.Width * scale),
+				Math.Max (1, caret.Height * scale));
+			rect.Intersect (new Rectangle (0, 0, bitmap.Width, bitmap.Height));
+			if (rect.Width <= 0 || rect.Height <= 0)
+				return;
+
+			Control control = Control.FromHandle (window.Hwnd.Handle);
+			Color color = control == null ? SystemColors.WindowText : control.ForeColor;
+			if (color.A == 0)
+				color = SystemColors.WindowText;
+
+			using (Graphics graphics = Graphics.FromImage (bitmap))
+			using (Brush brush = new SolidBrush (color)) {
+				graphics.FillRectangle (brush, rect);
+			}
+		}
+
+		void EnsureCaretTimer ()
+		{
+			if (caret.Timer != null)
+				return;
+
+			caret.Timer = new Timer ();
+			caret.Timer.Interval = Math.Max (1, CaretBlinkTime);
+			caret.Timer.Tick += CaretTimerTick;
+		}
+
+		void CaretTimerTick (object sender, EventArgs e)
+		{
+			if (!caret.Visible || caret.Hwnd == IntPtr.Zero) {
+				if (caret.Timer != null)
+					caret.Timer.Stop ();
+				return;
+			}
+
+			caret.On = !caret.On;
+			CommitCaretWindow (caret.Hwnd);
+		}
+
+		void CommitCaretWindow (IntPtr hwnd)
+		{
+			WaylandWindow window;
+			if (!windows.TryGetValue (hwnd, out window))
+				return;
+			if (!window.Hwnd.visible || window.SurfaceId == 0)
+				return;
+			CommitWindowBuffer (window);
 		}
 
 		void DestroyNativeWindow (WaylandWindow window)
