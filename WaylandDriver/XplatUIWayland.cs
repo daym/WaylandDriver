@@ -142,6 +142,8 @@ namespace System.Windows.Forms {
 		uint seatId;
 		uint pointerId;
 		uint keyboardId;
+		uint cursorShapeManagerId;
+		uint cursorShapeDeviceId;
 		uint lastInputSerial;
 		uint pointerEnterSerial;
 		uint cursorSurfaceId;
@@ -273,6 +275,7 @@ namespace System.Windows.Forms {
 			shmId = connection.Bind (registry, "wl_shm", 1);
 			xdgWmBaseId = connection.Bind (registry, "xdg_wm_base", 3);
 			seatId = connection.Bind (registry, "wl_seat", 5);
+			cursorShapeManagerId = connection.Bind (registry, "wp_cursor_shape_manager_v1", 1);
 			BindOutputs ();
 
 			if (compositorId == 0)
@@ -296,6 +299,10 @@ namespace System.Windows.Forms {
 				window.Dispose ();
 			foreach (WaylandShmBuffer buffer in waylandBuffers.Values)
 				buffer.Dispose ();
+			if (cursorShapeDeviceId != 0 && connection != null)
+				connection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.Destroy, null);
+			if (cursorShapeManagerId != 0 && connection != null)
+				connection.SendRequest (cursorShapeManagerId, WaylandProtocol.WpCursorShapeManagerV1.Destroy, null);
 			if (cursorSurfaceId != 0 && connection != null)
 				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Destroy, null);
 			foreach (WaylandCursor cursor in cursors.Values) {
@@ -315,6 +322,8 @@ namespace System.Windows.Forms {
 			evdevKeysDown.Clear ();
 			keyText.Clear ();
 			cursorSurfaceId = 0;
+			cursorShapeDeviceId = 0;
+			cursorShapeManagerId = 0;
 			cursorSurfaceCommitted = false;
 			renderedCursor = IntPtr.Zero;
 
@@ -1716,6 +1725,21 @@ namespace System.Windows.Forms {
 				handle = DefineStdCursor (StdCursor.Default);
 
 			WaylandCursor cursor = GetCursorDefinition (handle);
+			uint shape;
+			if (TryGetCursorShape (cursor, out shape)) {
+				EnsureCursorShapeDevice ();
+				if (cursorShapeDeviceId != 0) {
+					// cursor-shape-v1 lets standard WinForms cursors use the
+					// compositor/theme's cursor artwork.  Keep the SHM cursor
+					// path below for custom cursors and older compositors.
+					connection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.SetShape, delegate (WaylandRequestBuilder b) {
+						b.WriteUInt32 (pointerEnterSerial);
+						b.WriteUInt32 (shape);
+					});
+					return;
+				}
+			}
+
 			int scale = Math.Max (1, GetTargetScale (window));
 			EnsureCursorSurface ();
 			RenderCursorSurface (cursor, scale);
@@ -1741,6 +1765,102 @@ namespace System.Windows.Forms {
 				b.WriteNewId (cursorSurfaceId);
 			});
 			cursorSurfaceCommitted = false;
+		}
+
+		void EnsureCursorShapeDevice ()
+		{
+			if (cursorShapeManagerId == 0 || pointerId == 0 || cursorShapeDeviceId != 0)
+				return;
+
+			cursorShapeDeviceId = connection.AllocateId ();
+			connection.SendRequest (cursorShapeManagerId, WaylandProtocol.WpCursorShapeManagerV1.GetPointer, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (cursorShapeDeviceId);
+				b.WriteObject (pointerId);
+			});
+		}
+
+		bool TryGetCursorShape (WaylandCursor cursor, out uint shape)
+		{
+			shape = 0;
+			if (!cursor.Standard)
+				return false;
+
+			switch (cursor.StandardId) {
+			case StdCursor.Default:
+			case StdCursor.Arrow:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.Default;
+				return true;
+			case StdCursor.AppStarting:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.Progress;
+				return true;
+			case StdCursor.Cross:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.Crosshair;
+				return true;
+			case StdCursor.Hand:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.Pointer;
+				return true;
+			case StdCursor.Help:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.Help;
+				return true;
+			case StdCursor.IBeam:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.Text;
+				return true;
+			case StdCursor.No:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.NotAllowed;
+				return true;
+			case StdCursor.NoMove2D:
+			case StdCursor.SizeAll:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.AllScroll;
+				return true;
+			case StdCursor.NoMoveHoriz:
+			case StdCursor.HSplit:
+			case StdCursor.SizeWE:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.EwResize;
+				return true;
+			case StdCursor.NoMoveVert:
+			case StdCursor.VSplit:
+			case StdCursor.SizeNS:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.NsResize;
+				return true;
+			case StdCursor.SizeNESW:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.NeswResize;
+				return true;
+			case StdCursor.SizeNWSE:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.NwseResize;
+				return true;
+			case StdCursor.PanEast:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.EResize;
+				return true;
+			case StdCursor.PanNE:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.NeResize;
+				return true;
+			case StdCursor.PanNorth:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.NResize;
+				return true;
+			case StdCursor.PanNW:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.NwResize;
+				return true;
+			case StdCursor.PanSE:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.SeResize;
+				return true;
+			case StdCursor.PanSouth:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.SResize;
+				return true;
+			case StdCursor.PanSW:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.SwResize;
+				return true;
+			case StdCursor.PanWest:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.WResize;
+				return true;
+			case StdCursor.UpArrow:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.NResize;
+				return true;
+			case StdCursor.WaitCursor:
+				shape = WaylandProtocol.WpCursorShapeDeviceV1.Wait;
+				return true;
+			default:
+				return false;
+			}
 		}
 
 		void RenderCursorSurface (WaylandCursor cursor, int scale)
@@ -2313,8 +2433,13 @@ namespace System.Windows.Forms {
 					connection.SendRequest (seatId, WaylandProtocol.WlSeat.GetPointer, delegate (WaylandRequestBuilder b) {
 						b.WriteNewId (pointerId);
 					});
+					EnsureCursorShapeDevice ();
 				}
 			} else if (pointerId != 0) {
+				if (cursorShapeDeviceId != 0) {
+					connection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.Destroy, null);
+					cursorShapeDeviceId = 0;
+				}
 				connection.SendRequest (pointerId, WaylandProtocol.WlPointer.Release, null);
 				pointerId = 0;
 				pointerWindow = null;

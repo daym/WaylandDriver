@@ -120,6 +120,51 @@ namespace WaylandDriver.Wayland {
 			public const uint KeyStatePressed = 1;
 		}
 
+		internal static class WpCursorShapeManagerV1 {
+			public const ushort Destroy = 0;
+			public const ushort GetPointer = 1;
+		}
+
+		internal static class WpCursorShapeDeviceV1 {
+			public const ushort Destroy = 0;
+			public const ushort SetShape = 1;
+
+			public const uint Default = 1;
+			public const uint ContextMenu = 2;
+			public const uint Help = 3;
+			public const uint Pointer = 4;
+			public const uint Progress = 5;
+			public const uint Wait = 6;
+			public const uint Cell = 7;
+			public const uint Crosshair = 8;
+			public const uint Text = 9;
+			public const uint VerticalText = 10;
+			public const uint Alias = 11;
+			public const uint Copy = 12;
+			public const uint Move = 13;
+			public const uint NoDrop = 14;
+			public const uint NotAllowed = 15;
+			public const uint Grab = 16;
+			public const uint Grabbing = 17;
+			public const uint EResize = 18;
+			public const uint NResize = 19;
+			public const uint NeResize = 20;
+			public const uint NwResize = 21;
+			public const uint SResize = 22;
+			public const uint SeResize = 23;
+			public const uint SwResize = 24;
+			public const uint WResize = 25;
+			public const uint EwResize = 26;
+			public const uint NsResize = 27;
+			public const uint NeswResize = 28;
+			public const uint NwseResize = 29;
+			public const uint ColResize = 30;
+			public const uint RowResize = 31;
+			public const uint AllScroll = 32;
+			public const uint ZoomIn = 33;
+			public const uint ZoomOut = 34;
+		}
+
 		internal static class XdgWmBase {
 			public const ushort Destroy = 0;
 			public const ushort CreatePositioner = 1;
