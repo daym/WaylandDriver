@@ -87,8 +87,7 @@ namespace WaylandDriver.Wayland {
 
 		public void DestroyWaylandObject (WaylandConnection connection)
 		{
-			if (connection != null)
-				connection.SendRequest (BufferId, WaylandProtocol.WlBuffer.Destroy, null);
+			connection.SendRequest (BufferId, WaylandProtocol.WlBuffer.Destroy, null);
 			Dispose ();
 		}
 
