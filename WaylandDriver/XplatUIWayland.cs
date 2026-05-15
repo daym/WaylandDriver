@@ -193,6 +193,8 @@ namespace System.Windows.Forms {
 		const uint XkbModifierMod3Mask = 1u << 5;
 		const uint XkbModifierMod4Mask = 1u << 6;
 		const uint XkbModifierMod5Mask = 1u << 7;
+		const uint XkbAllRealModifierMask = XkbModifierShiftMask | XkbModifierLockMask | XkbModifierControlMask |
+			XkbModifierMod1Mask | XkbModifierMod2Mask | XkbModifierMod3Mask | XkbModifierMod4Mask | XkbModifierMod5Mask;
 		const uint UnicodeMaxCodePoint = 0x10ffff;
 		const uint XkbKeysymUnicodePrefix = 0x01000000;
 		const uint XkbKeysymUnicodePrefixMask = 0xff000000;
@@ -317,6 +319,7 @@ namespace System.Windows.Forms {
 			sealed class ParsedKey {
 				public XkbSymbol [][] Groups;
 				public string [] TypeNames;
+				public string [] VirtualModifierNames = EmptyStringArray;
 			}
 
 			struct XkbSymbol {
@@ -341,6 +344,24 @@ namespace System.Windows.Forms {
 			struct XkbTypePreserve {
 				public string [] ModifierNames;
 				public string [] PreserveNames;
+			}
+
+			enum InterpretPredicateOperation {
+				AnyOfOrNone,
+				AnyOf,
+				Any,
+				NoneOf,
+				AllOf,
+				Exactly
+			}
+
+			struct CompatInterpret {
+				public string SymbolName;
+				public string VirtualModifierName;
+				public bool LevelOneOnly;
+				public InterpretPredicateOperation PredicateOperation;
+				public uint PredicateMask;
+				public int Order;
 			}
 
 			sealed class XkbResolvedType {
@@ -381,9 +402,12 @@ namespace System.Windows.Forms {
 				readonly Dictionary<string, uint> keycodes = new Dictionary<string, uint> (StringComparer.Ordinal);
 				readonly Dictionary<string, ParsedKey> symbols = new Dictionary<string, ParsedKey> (StringComparer.Ordinal);
 				readonly Dictionary<string, XkbType> types = new Dictionary<string, XkbType> (StringComparer.Ordinal);
-				readonly Dictionary<string, string> compatVirtualModifiers = new Dictionary<string, string> (StringComparer.Ordinal);
+				readonly List<CompatInterpret> compatInterprets = new List<CompatInterpret> ();
 				readonly List<ModifierMapEntry> modifierMaps = new List<ModifierMapEntry> ();
+				readonly Dictionary<string, uint> explicitVirtualModifierMasks = new Dictionary<string, uint> (StringComparer.Ordinal);
 				readonly string [] defaultSymbolTypeNames = new string [4];
+				int nextInterpretOrder;
+				string unsupportedDiagnostic;
 
 				public Parser (string text)
 				{
@@ -407,7 +431,8 @@ namespace System.Windows.Forms {
 								continue;
 							}
 
-							if (lexer.ReadIfIdentifier ("xkb_compatibility")) {
+							if (lexer.ReadIfIdentifier ("xkb_compatibility") || lexer.ReadIfIdentifier ("xkb_compatibility_map") ||
+								lexer.ReadIfIdentifier ("xkb_compat") || lexer.ReadIfIdentifier ("xkb_compat_map")) {
 								ParseCompatibility ();
 								continue;
 							}
@@ -417,10 +442,21 @@ namespace System.Windows.Forms {
 								continue;
 							}
 
+							if (lexer.ReadIfIdentifier ("include")) {
+								Unsupported ("include statement requires external XKB files");
+								SkipToStatementEnd ();
+								continue;
+							}
+
 							lexer.Read ();
 						}
 					} catch (InvalidOperationException e) {
 						diagnostic = e.Message;
+						return false;
+					}
+
+					if (unsupportedDiagnostic != null) {
+						diagnostic = unsupportedDiagnostic;
 						return false;
 					}
 
@@ -501,15 +537,18 @@ namespace System.Windows.Forms {
 
 					XkbType type;
 					if (!types.TryGetValue (name, out type)) {
-						if (name == "ONE_LEVEL") {
-							resolved = new XkbResolvedType ();
-							resolved.Name = name;
-							resolvedTypes [name] = resolved;
-							return true;
+						type = CreateStandardType (name);
+						if (type == null) {
+							diagnostic = "referenced XKB type \"" + name + "\" was not found";
+							return false;
 						}
+					}
 
-						diagnostic = "referenced XKB type \"" + name + "\" was not found";
-						return false;
+					if (type.Name == "ONE_LEVEL" && type.ModifierNames.Length == 0 && type.Maps.Count == 0 && type.Preserves.Count == 0) {
+						resolved = new XkbResolvedType ();
+						resolved.Name = name;
+						resolvedTypes [name] = resolved;
+						return true;
 					}
 
 					uint modifierMask;
@@ -560,7 +599,11 @@ namespace System.Windows.Forms {
 
 				Dictionary<string, uint> ResolveVirtualModifierMasks ()
 				{
-					Dictionary<string, uint> masks = new Dictionary<string, uint> (StringComparer.Ordinal);
+					// XKB virtual modifier encoding is explicit declarations OR
+					// implicit bindings from real modifier maps whose keys carry
+					// the virtual modifier through key properties or compat
+					// interprets.
+					Dictionary<string, uint> masks = new Dictionary<string, uint> (explicitVirtualModifierMasks, StringComparer.Ordinal);
 					foreach (ModifierMapEntry map in modifierMaps) {
 						foreach (ModifierMapMember member in map.Members) {
 							if (member.IsKeyName) {
@@ -568,35 +611,145 @@ namespace System.Windows.Forms {
 								if (symbols.TryGetValue (member.Name, out key))
 									AddVirtualModifiersFromKey (masks, key, map.Mask);
 							} else
-								AddVirtualModifierFromSymbolName (masks, member.Name, map.Mask);
+								AddVirtualModifiersFromModifierMapSymbol (masks, member.Name, map.Mask);
 						}
 					}
 					return masks;
+				}
+
+				void AddVirtualModifiersFromModifierMapSymbol (Dictionary<string, uint> masks, string symbolName, uint mask)
+				{
+					bool found = false;
+					uint bestKeycode = UInt32.MaxValue;
+					int bestGroup = Int32.MaxValue;
+					int bestLevel = Int32.MaxValue;
+
+					foreach (KeyValuePair<string, ParsedKey> item in symbols) {
+						uint keycode;
+						if (!keycodes.TryGetValue (item.Key, out keycode))
+							continue;
+						ParsedKey key = item.Value;
+						if (key.Groups == null)
+							continue;
+						for (int group = 0; group < key.Groups.Length; group++) {
+							XkbSymbol [] groupSymbols = key.Groups [group];
+							if (groupSymbols == null)
+								continue;
+							for (int level = 0; level < groupSymbols.Length; level++) {
+								if (groupSymbols [level].Name != symbolName)
+									continue;
+								if (!found || group < bestGroup || group == bestGroup && (level < bestLevel || level == bestLevel && keycode < bestKeycode)) {
+									found = true;
+									bestGroup = group;
+									bestLevel = level;
+									bestKeycode = keycode;
+								}
+							}
+						}
+					}
+
+					if (found)
+						AddVirtualModifierFromSymbolName (masks, symbolName, bestGroup, bestLevel, mask);
 				}
 
 				void AddVirtualModifiersFromKey (Dictionary<string, uint> masks, ParsedKey key, uint mask)
 				{
 					if (key.Groups == null)
 						return;
+					for (int i = 0; i < key.VirtualModifierNames.Length; i++)
+						AddVirtualModifierMask (masks, key.VirtualModifierNames [i], mask);
 					for (int group = 0; group < key.Groups.Length; group++) {
 						XkbSymbol [] symbols = key.Groups [group];
 						if (symbols == null)
 							continue;
 						for (int level = 0; level < symbols.Length; level++) {
 							if (!symbols [level].NoSymbol)
-								AddVirtualModifierFromSymbolName (masks, symbols [level].Name, mask);
+								AddVirtualModifierFromSymbolName (masks, symbols [level].Name, group, level, mask);
 						}
 					}
 				}
 
-				void AddVirtualModifierFromSymbolName (Dictionary<string, uint> masks, string symbolName, uint mask)
+				void AddVirtualModifierFromSymbolName (Dictionary<string, uint> masks, string symbolName, int group, int level, uint keyModifierMask)
 				{
 					if (String.IsNullOrEmpty (symbolName))
 						return;
 
-					string virtualModifier;
-					if (compatVirtualModifiers.TryGetValue (symbolName, out virtualModifier))
-						AddVirtualModifierMask (masks, virtualModifier, mask);
+					bool found = false;
+					CompatInterpret best = new CompatInterpret ();
+					int bestSymbolSpecificity = -1;
+					int bestSpecificity = -1;
+					foreach (CompatInterpret interpret in compatInterprets) {
+						if (!InterpretSymbolMatches (interpret.SymbolName, symbolName))
+							continue;
+						if (interpret.LevelOneOnly && (group != 0 || level != 0))
+							continue;
+						if (!InterpretPredicateMatches (interpret, keyModifierMask))
+							continue;
+
+						int symbolSpecificity = InterpretSymbolSpecificity (interpret.SymbolName, symbolName);
+						int specificity = InterpretPredicateSpecificity (interpret.PredicateOperation);
+						if (!found || symbolSpecificity > bestSymbolSpecificity ||
+							symbolSpecificity == bestSymbolSpecificity && (specificity > bestSpecificity ||
+							specificity == bestSpecificity && interpret.Order < best.Order)) {
+							found = true;
+							best = interpret;
+							bestSymbolSpecificity = symbolSpecificity;
+							bestSpecificity = specificity;
+						}
+					}
+
+					if (found)
+						AddVirtualModifierMask (masks, best.VirtualModifierName, keyModifierMask);
+				}
+
+				static bool InterpretSymbolMatches (string pattern, string symbolName)
+				{
+					return pattern == symbolName || pattern == "Any" || pattern == "NoSymbol";
+				}
+
+				static int InterpretSymbolSpecificity (string pattern, string symbolName)
+				{
+					return pattern == symbolName ? 1 : 0;
+				}
+
+				static bool InterpretPredicateMatches (CompatInterpret interpret, uint keyModifierMask)
+				{
+					uint mask = interpret.PredicateMask;
+					switch (interpret.PredicateOperation) {
+					case InterpretPredicateOperation.AnyOfOrNone:
+						return keyModifierMask == 0 || (keyModifierMask & mask) != 0;
+					case InterpretPredicateOperation.AnyOf:
+					case InterpretPredicateOperation.Any:
+						return (keyModifierMask & mask) != 0;
+					case InterpretPredicateOperation.NoneOf:
+						return (keyModifierMask & mask) == 0;
+					case InterpretPredicateOperation.AllOf:
+						return (keyModifierMask & mask) == mask;
+					case InterpretPredicateOperation.Exactly:
+						return keyModifierMask == mask;
+					default:
+						return false;
+					}
+				}
+
+				static int InterpretPredicateSpecificity (InterpretPredicateOperation operation)
+				{
+					switch (operation) {
+					case InterpretPredicateOperation.AnyOfOrNone:
+						return 0;
+					case InterpretPredicateOperation.AnyOf:
+						return 1;
+					case InterpretPredicateOperation.Any:
+						return 2;
+					case InterpretPredicateOperation.NoneOf:
+						return 3;
+					case InterpretPredicateOperation.AllOf:
+						return 4;
+					case InterpretPredicateOperation.Exactly:
+						return 5;
+					default:
+						return -1;
+					}
 				}
 
 				static void AddVirtualModifierMask (Dictionary<string, uint> masks, string name, uint mask)
@@ -636,6 +789,12 @@ namespace System.Windows.Forms {
 					return true;
 				}
 
+				void Unsupported (string diagnostic)
+				{
+					if (unsupportedDiagnostic == null)
+						unsupportedDiagnostic = diagnostic;
+				}
+
 				void ParseKeycodes ()
 				{
 					if (!SkipToBlockStart ())
@@ -656,6 +815,9 @@ namespace System.Windows.Forms {
 						}
 
 						if (depth != 1)
+							continue;
+
+						if (token.Kind == TokenKind.Identifier && !ApplyMergeModePrefix (ref token))
 							continue;
 
 						if (token.Kind == TokenKind.KeyName) {
@@ -704,7 +866,12 @@ namespace System.Windows.Forms {
 						if (depth != 1 || token.Kind != TokenKind.Identifier)
 							continue;
 
-						if (token.Text == "type")
+						if (!ApplyMergeModePrefix (ref token))
+							continue;
+
+						if (token.Text == "virtual_modifiers")
+							ParseVirtualModifiers ();
+						else if (token.Text == "type")
 							ParseTypeStatement ();
 						else
 							SkipPropertyTail ();
@@ -825,7 +992,15 @@ namespace System.Windows.Forms {
 						if (depth != 1 || token.Kind != TokenKind.Identifier)
 							continue;
 
-						if (token.Text == "interpret" && !lexer.PeekIsSymbol ('.'))
+						if (!ApplyMergeModePrefix (ref token))
+							continue;
+
+						if (token.Text == "virtual_modifiers")
+							ParseVirtualModifiers ();
+						else if (token.Text == "include") {
+							Unsupported ("include statement requires external XKB files");
+							SkipToStatementEnd ();
+						} else if (token.Text == "interpret" && !lexer.PeekIsSymbol ('.'))
 							ParseInterpret ();
 						else
 							SkipPropertyTail ();
@@ -839,6 +1014,15 @@ namespace System.Windows.Forms {
 					if (String.IsNullOrEmpty (symbolName)) {
 						SkipStatementOrBlock ();
 						return;
+					}
+					bool levelOneOnly = false;
+					string virtualModifierName = null;
+					InterpretPredicateOperation predicateOperation = InterpretPredicateOperation.AnyOfOrNone;
+					uint predicateMask = XkbAllRealModifierMask;
+					if (lexer.ReadIfSymbol ('+')) {
+						string diagnostic;
+						if (!ParseInterpretPredicate (out predicateOperation, out predicateMask, out diagnostic))
+							Unsupported (diagnostic);
 					}
 
 					if (!SkipToBlockStart ()) {
@@ -867,7 +1051,15 @@ namespace System.Windows.Forms {
 							if (lexer.ReadIfSymbol ('=')) {
 								Token value = lexer.Read ();
 								if (value.Kind == TokenKind.Identifier)
-									compatVirtualModifiers [symbolName] = value.Text;
+									virtualModifierName = value.Text;
+							}
+							SkipToStatementEnd ();
+						} else if (token.Text == "useModMapMods" || token.Text == "useModMap") {
+							if (lexer.ReadIfSymbol ('=')) {
+								Token value = lexer.Read ();
+								string text = TokenText (value);
+								levelOneOnly = String.Equals (text, "level1", StringComparison.OrdinalIgnoreCase) ||
+									String.Equals (text, "Level1", StringComparison.Ordinal);
 							}
 							SkipToStatementEnd ();
 						} else
@@ -875,6 +1067,140 @@ namespace System.Windows.Forms {
 					}
 
 					SkipToStatementEnd ();
+					if (!String.IsNullOrEmpty (virtualModifierName)) {
+						CompatInterpret interpret = new CompatInterpret ();
+						interpret.SymbolName = symbolName;
+						interpret.VirtualModifierName = virtualModifierName;
+						interpret.LevelOneOnly = levelOneOnly;
+						interpret.PredicateOperation = predicateOperation;
+						interpret.PredicateMask = predicateMask;
+						interpret.Order = nextInterpretOrder++;
+						compatInterprets.Add (interpret);
+					}
+				}
+
+				bool ParseInterpretPredicate (out InterpretPredicateOperation operation, out uint mask, out string diagnostic)
+				{
+					operation = InterpretPredicateOperation.Exactly;
+					mask = 0;
+					diagnostic = null;
+
+					Token first = lexer.Read ();
+					if (first.Kind == TokenKind.End) {
+						diagnostic = "unterminated XKB interpret predicate";
+						return false;
+					}
+
+					string text = TokenText (first);
+					if (TryParseInterpretPredicateOperation (text, out operation)) {
+						mask = XkbAllRealModifierMask;
+						if (lexer.ReadIfSymbol ('('))
+							return ParseRealModifierMaskUntil (')', out mask, out diagnostic);
+						return true;
+					}
+
+					if (!AddRealModifierMaskToken (first, ref mask, out diagnostic))
+						return false;
+
+					while (true) {
+						Token token = lexer.Peek ();
+						if (token.Kind == TokenKind.End) {
+							diagnostic = "unterminated XKB interpret predicate";
+							return false;
+						}
+						if (token.Kind == TokenKind.Symbol && token.Symbol == '{')
+							return true;
+
+						token = lexer.Read ();
+						if (token.Kind == TokenKind.Symbol)
+							continue;
+						if (!AddRealModifierMaskToken (token, ref mask, out diagnostic))
+							return false;
+					}
+				}
+
+				bool ParseRealModifierMaskUntil (char terminator, out uint mask, out string diagnostic)
+				{
+					mask = 0;
+					diagnostic = null;
+					while (true) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End) {
+							diagnostic = "unterminated XKB real modifier mask";
+							return false;
+						}
+						if (token.Kind == TokenKind.Symbol && token.Symbol == terminator)
+							return true;
+						if (token.Kind == TokenKind.Symbol)
+							continue;
+						if (!AddRealModifierMaskToken (token, ref mask, out diagnostic))
+							return false;
+					}
+				}
+
+				static bool TryParseInterpretPredicateOperation (string text, out InterpretPredicateOperation operation)
+				{
+					if (String.Equals (text, "AnyOfOrNone", StringComparison.OrdinalIgnoreCase)) {
+						operation = InterpretPredicateOperation.AnyOfOrNone;
+						return true;
+					}
+					if (String.Equals (text, "AnyOf", StringComparison.OrdinalIgnoreCase)) {
+						operation = InterpretPredicateOperation.AnyOf;
+						return true;
+					}
+					if (String.Equals (text, "Any", StringComparison.OrdinalIgnoreCase)) {
+						operation = InterpretPredicateOperation.Any;
+						return true;
+					}
+					if (String.Equals (text, "NoneOf", StringComparison.OrdinalIgnoreCase)) {
+						operation = InterpretPredicateOperation.NoneOf;
+						return true;
+					}
+					if (String.Equals (text, "AllOf", StringComparison.OrdinalIgnoreCase)) {
+						operation = InterpretPredicateOperation.AllOf;
+						return true;
+					}
+					if (String.Equals (text, "Exactly", StringComparison.OrdinalIgnoreCase)) {
+						operation = InterpretPredicateOperation.Exactly;
+						return true;
+					}
+
+					operation = InterpretPredicateOperation.Exactly;
+					return false;
+				}
+
+				static bool AddRealModifierMaskToken (Token token, ref uint mask, out string diagnostic)
+				{
+					diagnostic = null;
+					if (token.Kind == TokenKind.Identifier) {
+						string name = token.Text;
+						if (IsNoModifierName (name))
+							return true;
+						if (String.Equals (name, "all", StringComparison.OrdinalIgnoreCase) ||
+							String.Equals (name, "any", StringComparison.OrdinalIgnoreCase)) {
+							mask |= XkbAllRealModifierMask;
+							return true;
+						}
+						uint namedMask = ModifierMaskForName (name);
+						if (namedMask != 0) {
+							mask |= namedMask;
+							return true;
+						}
+						diagnostic = "XKB interpret predicate references non-real modifier " + name;
+						return false;
+					}
+
+					if (token.Kind == TokenKind.Number) {
+						if ((token.Number & ~XkbAllRealModifierMask) != 0) {
+							diagnostic = "XKB interpret predicate numeric mask includes non-real modifiers";
+							return false;
+						}
+						mask |= token.Number;
+						return true;
+					}
+
+					diagnostic = "invalid XKB interpret predicate token";
+					return false;
 				}
 
 				void ParseSymbols ()
@@ -900,7 +1226,15 @@ namespace System.Windows.Forms {
 						if (depth != 1 || token.Kind != TokenKind.Identifier)
 							continue;
 
-						if (token.Text == "key") {
+						if (!ApplyMergeModePrefix (ref token))
+							continue;
+
+						if (token.Text == "virtual_modifiers")
+							ParseVirtualModifiers ();
+						else if (token.Text == "include") {
+							Unsupported ("include statement requires external XKB files");
+							SkipToStatementEnd ();
+						} else if (token.Text == "key") {
 							if (lexer.PeekIsSymbol ('.'))
 								ParseKeyDefaultStatement ();
 							else
@@ -908,12 +1242,46 @@ namespace System.Windows.Forms {
 						}
 						else if (token.Text == "type")
 							ParseDefaultTypeStatement ();
-						else if (token.Text == "modifier_map")
+						else if (token.Text == "modifier_map" || token.Text == "mod_map" || token.Text == "modmap")
 							ParseModifierMap ();
 						else
 							SkipPropertyTail ();
 					}
 					Array.Copy (savedDefaultTypeNames, defaultSymbolTypeNames, defaultSymbolTypeNames.Length);
+				}
+
+				void ParseVirtualModifiers ()
+				{
+					while (true) {
+						Token name = lexer.Read ();
+						if (name.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated virtual_modifiers statement");
+						if (name.Kind == TokenKind.Symbol && name.Symbol == ';')
+							break;
+						if (name.Kind != TokenKind.Identifier) {
+							SkipToStatementEnd ();
+							break;
+						}
+
+						uint mask = 0;
+						if (lexer.ReadIfSymbol ('=')) {
+							string diagnostic;
+							if (!ParseModifierMaskUntil (new char [] { ',', ';' }, out mask, out diagnostic))
+								Unsupported (diagnostic);
+						}
+						if (!explicitVirtualModifierMasks.ContainsKey (name.Text))
+							explicitVirtualModifierMasks [name.Text] = mask;
+
+						Token separator = lexer.Peek ();
+						if (separator.Kind == TokenKind.Symbol && separator.Symbol == ',') {
+							lexer.Read ();
+							continue;
+						}
+						if (separator.Kind == TokenKind.Symbol && separator.Symbol == ';') {
+							lexer.Read ();
+							break;
+						}
+					}
 				}
 
 				void ParseKeyDefaultStatement ()
@@ -963,6 +1331,7 @@ namespace System.Windows.Forms {
 
 					Dictionary<int, XkbSymbol []> groups = new Dictionary<int, XkbSymbol []> ();
 					Dictionary<int, string> typeNames = new Dictionary<int, string> ();
+					List<string> virtualModifierNames = new List<string> ();
 					int nextGroup = 0;
 					int depth = 1;
 					while (depth > 0) {
@@ -1009,6 +1378,12 @@ namespace System.Windows.Forms {
 							if (typeToken.Kind == TokenKind.String || typeToken.Kind == TokenKind.Identifier)
 								typeNames [group] = TokenText (typeToken);
 							SkipKeyFieldEnd ();
+						} else if (token.Text == "virtualModifiers" || token.Text == "virtualmodifiers" || token.Text == "virtualModifier") {
+							if (lexer.ReadIfSymbol ('=')) {
+								string [] names = ParseModifierNameListUntilKeyField ();
+								virtualModifierNames.AddRange (names);
+							} else
+								SkipKeyFieldEnd ();
 						} else
 							SkipKeyPropertyTail ();
 					}
@@ -1036,6 +1411,7 @@ namespace System.Windows.Forms {
 						key.TypeNames [group] = defaultSymbolTypeNames [group];
 					foreach (KeyValuePair<int, string> typeName in typeNames)
 						key.TypeNames [typeName.Key] = typeName.Value;
+					key.VirtualModifierNames = virtualModifierNames.ToArray ();
 					symbols [nameToken.Text] = key;
 				}
 
@@ -1091,19 +1467,73 @@ namespace System.Windows.Forms {
 								depth++;
 							else if (token.Symbol == ']')
 								depth--;
+							else if (depth == 1 && token.Symbol == '{')
+								list.Add (ParseSymbolSet ());
 							continue;
 						}
 
 						if (depth == 1) {
 							XkbSymbol symbol;
-							if (TryCreateSymbol (TokenText (token), out symbol))
+							if (TryCreateSymbol (token, out symbol))
 								list.Add (symbol);
-							else if (token.Kind == TokenKind.Identifier || token.Kind == TokenKind.Number || token.Kind == TokenKind.String)
+							else if (token.Kind == TokenKind.Identifier || token.Kind == TokenKind.Number || token.Kind == TokenKind.String) {
+								Unsupported ("unknown XKB keysym " + TokenText (token));
 								list.Add (NoSymbol ());
+							}
 						}
 					}
 
 					return list.ToArray ();
+				}
+
+				XkbSymbol ParseSymbolSet ()
+				{
+					List<XkbSymbol> symbols = new List<XkbSymbol> ();
+					int depth = 1;
+					while (depth > 0) {
+						Token token = lexer.Read ();
+						if (token.Kind == TokenKind.End)
+							throw new InvalidOperationException ("unterminated XKB multi-symbol level");
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '{') {
+								Unsupported ("nested XKB multi-symbol level");
+								depth++;
+							} else if (token.Symbol == '}')
+								depth--;
+							continue;
+						}
+
+						if (depth == 1) {
+							XkbSymbol symbol;
+							if (TryCreateSymbol (token, out symbol))
+								symbols.Add (symbol);
+							else if (token.Kind == TokenKind.Identifier || token.Kind == TokenKind.Number || token.Kind == TokenKind.String)
+								Unsupported ("unknown XKB keysym " + TokenText (token));
+						}
+					}
+
+					if (symbols.Count == 0)
+						return NoSymbol ();
+
+					// XKB may provide several keysyms for one level.  WinForms
+					// wants one virtual key plus text, so keep the first keysym
+					// for KeyCode mapping and concatenate the printable text.
+					StringBuilder text = new StringBuilder ();
+					XkbSymbol result = NoSymbol ();
+					for (int i = 0; i < symbols.Count; i++) {
+						if (symbols [i].NoSymbol)
+							continue;
+						if (result.NoSymbol)
+							result = symbols [i];
+						if (!String.IsNullOrEmpty (symbols [i].Text))
+							text.Append (symbols [i].Text);
+					}
+					if (result.NoSymbol)
+						return NoSymbol ();
+					if (text.Length > 0)
+						result.Text = text.ToString ();
+					return result;
 				}
 
 				string [] ParseModifierNameListUntil (char terminator)
@@ -1129,10 +1559,109 @@ namespace System.Windows.Forms {
 							string name = token.Text;
 							if (!IsNoModifierName (name))
 								names.Add (name);
-						}
+						} else if (depth == 0 && token.Kind == TokenKind.Number)
+							Unsupported ("numeric XKB modifier mask requires libxkbcommon modifier indices");
 					}
 
 					return names.Count == 0 ? EmptyStringArray : names.ToArray ();
+				}
+
+				bool ParseModifierMaskUntil (char [] terminators, out uint mask, out string diagnostic)
+				{
+					mask = 0;
+					diagnostic = null;
+					int depth = 0;
+					while (true) {
+						Token token = lexer.Peek ();
+						if (token.Kind == TokenKind.End) {
+							diagnostic = "unterminated XKB virtual modifier mask";
+							return false;
+						}
+						if (depth == 0 && token.Kind == TokenKind.Symbol && IsTerminator (token.Symbol, terminators))
+							return true;
+
+						token = lexer.Read ();
+
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '(' || token.Symbol == '[' || token.Symbol == '{')
+								depth++;
+							else if ((token.Symbol == ')' || token.Symbol == ']' || token.Symbol == '}') && depth > 0)
+								depth--;
+							continue;
+						}
+
+						if (depth != 0)
+							continue;
+
+						if (token.Kind == TokenKind.Number) {
+							mask |= token.Number;
+							continue;
+						}
+
+						if (token.Kind == TokenKind.Identifier) {
+							string name = token.Text;
+							if (IsNoModifierName (name))
+								continue;
+							uint namedMask = ModifierMaskForName (name);
+							if (namedMask == 0) {
+								diagnostic = "virtual_modifiers explicit mask references non-real modifier " + name;
+								return false;
+							}
+							mask |= namedMask;
+						}
+					}
+				}
+
+				string [] ParseModifierNameListUntilKeyField ()
+				{
+					List<string> names = new List<string> ();
+					int depth = 0;
+					while (true) {
+						Token token = lexer.Peek ();
+						if (token.Kind == TokenKind.End)
+							return names.Count == 0 ? EmptyStringArray : names.ToArray ();
+						if (depth == 0 && token.Kind == TokenKind.Symbol && token.Symbol == ',') {
+							lexer.Read ();
+							return names.Count == 0 ? EmptyStringArray : names.ToArray ();
+						}
+						if (depth == 0 && token.Kind == TokenKind.Symbol && token.Symbol == '}')
+							return names.Count == 0 ? EmptyStringArray : names.ToArray ();
+
+						token = lexer.Read ();
+						if (token.Kind == TokenKind.Symbol) {
+							if (token.Symbol == '(' || token.Symbol == '[' || token.Symbol == '{')
+								depth++;
+							else if ((token.Symbol == ')' || token.Symbol == ']' || token.Symbol == '}') && depth > 0)
+								depth--;
+							continue;
+						}
+
+						if (depth == 0 && token.Kind == TokenKind.Identifier && !IsNoModifierName (token.Text))
+							names.Add (token.Text);
+						else if (depth == 0 && token.Kind == TokenKind.Number)
+							Unsupported ("numeric XKB virtual modifier map requires libxkbcommon modifier indices");
+					}
+				}
+
+				bool ApplyMergeModePrefix (ref Token token)
+				{
+					if (token.Kind != TokenKind.Identifier)
+						return true;
+					if (token.Text == "override") {
+						token = lexer.Read ();
+						if (token.Kind == TokenKind.String) {
+							Unsupported ("include statement requires external XKB files");
+							SkipToStatementEnd ();
+							return false;
+						}
+						return token.Kind != TokenKind.End;
+					}
+					if (IsUnsupportedMergeMode (token.Text)) {
+						Unsupported ("unsupported XKB merge mode " + token.Text);
+						SkipStatementOrBlock ();
+						return false;
+					}
+					return true;
 				}
 
 				void SkipPropertyTail ()
@@ -1364,16 +1893,79 @@ namespace System.Windows.Forms {
 						if (c == '\\' && position < text.Length) {
 							char escaped = text [position++];
 							switch (escaped) {
+							case 'b': builder.Append ('\b'); break;
+							case 'f': builder.Append ('\f'); break;
 							case 'n': builder.Append ('\n'); break;
 							case 'r': builder.Append ('\r'); break;
 							case 't': builder.Append ('\t'); break;
-							default: builder.Append (escaped); break;
+							case 'v': builder.Append ('\v'); break;
+							case '"': builder.Append ('"'); break;
+							case '\\': builder.Append ('\\'); break;
+							case 'u':
+								uint codepoint;
+								if (ReadBraceCodepoint (out codepoint))
+									builder.Append (Char.ConvertFromUtf32 ((int) codepoint));
+								else
+									builder.Append (escaped);
+								break;
+							default:
+								if (escaped >= '0' && escaped <= '7')
+									builder.Append (Char.ConvertFromUtf32 ((int) ReadOctalEscape (escaped)));
+								else
+									builder.Append (escaped);
+								break;
 							}
 						} else
 							builder.Append (c);
 					}
 
 					return new Token { Kind = TokenKind.String, Text = builder.ToString () };
+				}
+
+				uint ReadOctalEscape (char first)
+				{
+					uint value = (uint) (first - '0');
+					int digits = 1;
+					while (digits < 4 && position < text.Length && text [position] >= '0' && text [position] <= '7') {
+						value = (value << 3) | (uint) (text [position] - '0');
+						position++;
+						digits++;
+					}
+					return value;
+				}
+
+				bool ReadBraceCodepoint (out uint codepoint)
+				{
+					codepoint = 0;
+					if (position >= text.Length || text [position] != '{')
+						return false;
+					position++;
+					int start = position;
+					while (position < text.Length && text [position] != '}') {
+						if (!IsHexDigit (text [position]))
+							return false;
+						position++;
+					}
+					if (position >= text.Length || position == start)
+						return false;
+					string hex = text.Substring (start, position - start);
+					position++;
+					uint value = 0;
+					for (int i = 0; i < hex.Length; i++) {
+						char c = hex [i];
+						uint digit;
+						if (c >= '0' && c <= '9')
+							digit = (uint) (c - '0');
+						else if (c >= 'a' && c <= 'f')
+							digit = (uint) (c - 'a' + 10);
+						else
+							digit = (uint) (c - 'A' + 10);
+						value = (value << 4) | digit;
+					}
+					if (value == 0 || value > UnicodeMaxCodePoint)
+						return false;
+					codepoint = value;
+					return true;
 				}
 
 				Token ReadKeyName ()
@@ -1420,6 +2012,12 @@ namespace System.Windows.Forms {
 						char c = text [position];
 						if (Char.IsWhiteSpace (c)) {
 							position++;
+							continue;
+						}
+
+						if (c == '#') {
+							while (position < text.Length && text [position] != '\n')
+								position++;
 							continue;
 						}
 
@@ -1607,6 +2205,98 @@ namespace System.Windows.Forms {
 				return false;
 			}
 
+			static bool IsTerminator (char value, char [] terminators)
+			{
+				for (int i = 0; i < terminators.Length; i++) {
+					if (terminators [i] == value)
+						return true;
+				}
+				return false;
+			}
+
+			static bool IsUnsupportedMergeMode (string text)
+			{
+				return text == "augment" || text == "replace" || text == "alternate";
+			}
+
+			static XkbType CreateStandardType (string name)
+			{
+				XkbType type = new XkbType ();
+				type.Name = name;
+				switch (name) {
+				case "ONE_LEVEL":
+					return type;
+				case "TWO_LEVEL":
+					type.ModifierNames = new string [] { "Shift" };
+					AddTypeMap (type, EmptyStringArray, 0);
+					AddTypeMap (type, new string [] { "Shift" }, 1);
+					return type;
+				case "ALPHABETIC":
+					type.ModifierNames = new string [] { "Shift", "Lock" };
+					AddTypeMap (type, EmptyStringArray, 0);
+					AddTypeMap (type, new string [] { "Shift" }, 1);
+					AddTypeMap (type, new string [] { "Lock" }, 1);
+					AddTypeMap (type, new string [] { "Shift", "Lock" }, 0);
+					return type;
+				case "FOUR_LEVEL":
+					type.ModifierNames = new string [] { "Shift", "LevelThree" };
+					AddTypeMap (type, EmptyStringArray, 0);
+					AddTypeMap (type, new string [] { "Shift" }, 1);
+					AddTypeMap (type, new string [] { "LevelThree" }, 2);
+					AddTypeMap (type, new string [] { "Shift", "LevelThree" }, 3);
+					return type;
+				case "FOUR_LEVEL_SEMIALPHABETIC":
+					type.ModifierNames = new string [] { "Shift", "Lock", "LevelThree" };
+					AddTypeMap (type, EmptyStringArray, 0);
+					AddTypeMap (type, new string [] { "Shift" }, 1);
+					AddTypeMap (type, new string [] { "Lock" }, 1);
+					AddTypeMap (type, new string [] { "Shift", "Lock" }, 0);
+					AddTypeMap (type, new string [] { "LevelThree" }, 2);
+					AddTypeMap (type, new string [] { "Shift", "LevelThree" }, 3);
+					AddTypeMap (type, new string [] { "Lock", "LevelThree" }, 2);
+					AddTypeMap (type, new string [] { "Shift", "Lock", "LevelThree" }, 3);
+					AddTypePreserve (type, new string [] { "Lock", "LevelThree" }, new string [] { "Lock" });
+					AddTypePreserve (type, new string [] { "Shift", "Lock", "LevelThree" }, new string [] { "Lock" });
+					return type;
+				case "FOUR_LEVEL_ALPHABETIC":
+					type.ModifierNames = new string [] { "Shift", "Lock", "LevelThree" };
+					AddTypeMap (type, EmptyStringArray, 0);
+					AddTypeMap (type, new string [] { "Shift" }, 1);
+					AddTypeMap (type, new string [] { "Lock" }, 1);
+					AddTypeMap (type, new string [] { "Shift", "Lock" }, 0);
+					AddTypeMap (type, new string [] { "LevelThree" }, 2);
+					AddTypeMap (type, new string [] { "Shift", "LevelThree" }, 3);
+					AddTypeMap (type, new string [] { "Lock", "LevelThree" }, 3);
+					AddTypeMap (type, new string [] { "Shift", "Lock", "LevelThree" }, 2);
+					return type;
+				case "KEYPAD":
+					type.ModifierNames = new string [] { "Shift", "NumLock" };
+					AddTypeMap (type, EmptyStringArray, 0);
+					AddTypeMap (type, new string [] { "Shift" }, 1);
+					AddTypeMap (type, new string [] { "NumLock" }, 1);
+					AddTypeMap (type, new string [] { "Shift", "NumLock" }, 0);
+					return type;
+				default:
+					return null;
+				}
+			}
+
+			static void AddTypeMap (XkbType type, string [] modifiers, int level)
+			{
+				XkbTypeMap map = new XkbTypeMap ();
+				map.ModifierNames = modifiers;
+				map.Level = level;
+				type.Maps.Add (map);
+			}
+
+			static void AddTypePreserve (XkbType type, string [] modifiers, string [] preserve)
+			{
+				XkbTypePreserve entry = new XkbTypePreserve ();
+				entry.ModifierNames = modifiers;
+				entry.PreserveNames = preserve;
+				type.Preserves.Add (entry);
+			}
+
 			static string InferTypeName (XkbSymbol [] symbols)
 			{
 				int length = NormalizedSymbolLength (symbols);
@@ -1677,6 +2367,23 @@ namespace System.Windows.Forms {
 					symbol.Keysym >= XkbKeysymKp0 && symbol.Keysym <= XkbKeysymKp9;
 			}
 
+			static bool TryCreateSymbol (Token token, out XkbSymbol symbol)
+			{
+				if (token.Kind == TokenKind.String) {
+					symbol = SymbolFromString (token.Text);
+					return true;
+				}
+
+				if (token.Kind == TokenKind.Number) {
+					if (!String.IsNullOrEmpty (token.Text) && token.Text.Length == 1 && Char.IsDigit (token.Text [0]))
+						return TryCreateSymbol (token.Text, out symbol);
+					symbol = SymbolFromCodepoint (token.Number, token.Text);
+					return true;
+				}
+
+				return TryCreateSymbol (TokenText (token), out symbol);
+			}
+
 			static bool TryCreateSymbol (string name, out XkbSymbol symbol)
 			{
 				symbol = NoSymbol ();
@@ -1698,6 +2405,50 @@ namespace System.Windows.Forms {
 				symbol.Name = name;
 				symbol.Keysym = keysym;
 				symbol.Text = TextFromKeysym (keysym);
+				return true;
+			}
+
+			static XkbSymbol SymbolFromString (string text)
+			{
+				if (String.IsNullOrEmpty (text))
+					return NoSymbol ();
+
+				uint codepoint;
+				if (!TryReadCodepoint (text, 0, out codepoint))
+					return NoSymbol ();
+
+				XkbSymbol symbol = SymbolFromCodepoint (codepoint, text);
+				symbol.Text = text;
+				return symbol;
+			}
+
+			static XkbSymbol SymbolFromCodepoint (uint codepoint, string name)
+			{
+				XkbSymbol symbol = NoSymbol ();
+				if (codepoint == 0 || codepoint > UnicodeMaxCodePoint)
+					return symbol;
+				symbol.NoSymbol = false;
+				symbol.Name = name;
+				symbol.Keysym = codepoint <= 0xff ? codepoint : XkbKeysymUnicodePrefix | codepoint;
+				symbol.Text = TextFromKeysym (symbol.Keysym);
+				return symbol;
+			}
+
+			static bool TryReadCodepoint (string text, int index, out uint codepoint)
+			{
+				codepoint = 0;
+				if (index < 0 || index >= text.Length)
+					return false;
+				char c = text [index];
+				if (Char.IsHighSurrogate (c)) {
+					if (index + 1 >= text.Length || !Char.IsLowSurrogate (text [index + 1]))
+						return false;
+					codepoint = (uint) Char.ConvertToUtf32 (c, text [index + 1]);
+					return true;
+				}
+				if (Char.IsLowSurrogate (c))
+					return false;
+				codepoint = c;
 				return true;
 			}
 
@@ -1823,12 +2574,13 @@ namespace System.Windows.Forms {
 
 			static bool IsNoModifierName (string name)
 			{
-				return name == "none" || name == "None";
+				return String.Equals (name, "none", StringComparison.OrdinalIgnoreCase);
 			}
 
 			static bool IsUnsupportedModifierWildcard (string name)
 			{
-				return name == "all" || name == "All" || name == "any" || name == "Any";
+				return String.Equals (name, "all", StringComparison.OrdinalIgnoreCase) ||
+					String.Equals (name, "any", StringComparison.OrdinalIgnoreCase);
 			}
 
 			static Dictionary<string, uint> CreateNamedKeysyms ()
