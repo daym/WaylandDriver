@@ -5108,9 +5108,12 @@ namespace System.Windows.Forms {
 				// non-resizable Forms.  Wayland needs the same constraint before
 				// the first xdg_toplevel commit, because Mono can map visible Unix
 				// Forms before Form.CreateHandle later calls UpdateMinMax.
-				Size fixedSize = GetToplevelWindowSize (window);
+				Size fixedSize = GetToplevelSurfaceSize (window);
 				min = fixedSize;
 				max = fixedSize;
+			} else {
+				min = TranslateWindowSizeToToplevelSurfaceSize (window, min);
+				max = TranslateWindowSizeToToplevelSurfaceSize (window, max);
 			}
 
 			WaylandConnection liveConnection = RequireConnection ();
@@ -6638,12 +6641,21 @@ namespace System.Windows.Forms {
 
 			if (width <= 0 || height <= 0)
 				return;
-			if (width == window.Hwnd.Width && height == window.Hwnd.Height)
+
+			// xdg_toplevel.configure is the size of this wl_surface's window
+			// geometry.  This backend's top-level surface buffer contains only
+			// the WinForms client area; Mono's Hwnd.Width/Height remain whole
+			// Win32-style window sizes including its managed nonclient frame.
+			// Convert compositor surface sizes back to Mono window sizes before
+			// updating Hwnd, or each configure subtracts the frame again and the
+			// surface shrinks toward 1x1.
+			Size windowSize = TranslateToplevelSurfaceSizeToWindowSize (window, new Size (width, height));
+			if (windowSize.Width == window.Hwnd.Width && windowSize.Height == window.Hwnd.Height)
 				return;
 
-			window.Hwnd.Width = width;
-			window.Hwnd.Height = height;
-			window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (width, height);
+			window.Hwnd.Width = windowSize.Width;
+			window.Hwnd.Height = windowSize.Height;
+			window.Hwnd.ClientRect = window.Hwnd.GetClientRectangle (windowSize.Width, windowSize.Height);
 			window.Dispose ();
 			PostMessage (window.Hwnd.Handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
 			Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
@@ -6675,9 +6687,31 @@ namespace System.Windows.Forms {
 			return !StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_THICKFRAME);
 		}
 
-		Size GetToplevelWindowSize (WaylandWindow window)
+		Size GetToplevelSurfaceSize (WaylandWindow window)
 		{
-			return new Size (Math.Max (1, window.Hwnd.Width), Math.Max (1, window.Hwnd.Height));
+			Rectangle client = window.Hwnd.ClientRect;
+			return new Size (Math.Max (1, client.Width), Math.Max (1, client.Height));
+		}
+
+		Size TranslateWindowSizeToToplevelSurfaceSize (WaylandWindow window, Size windowSize)
+		{
+			if (windowSize == Size.Empty || windowSize.Width <= 0 || windowSize.Height <= 0)
+				return windowSize;
+
+			Rectangle client = window.Hwnd.GetClientRectangle (windowSize.Width, windowSize.Height);
+			return new Size (Math.Max (1, client.Width), Math.Max (1, client.Height));
+		}
+
+		Size TranslateToplevelSurfaceSizeToWindowSize (WaylandWindow window, Size surfaceSize)
+		{
+			if (surfaceSize == Size.Empty || surfaceSize.Width <= 0 || surfaceSize.Height <= 0)
+				return surfaceSize;
+
+			CreateParams cp = new CreateParams ();
+			cp.WindowStyle = window.Hwnd.initial_style;
+			cp.WindowExStyle = window.Hwnd.initial_ex_style;
+			Rectangle windowRect = Hwnd.GetWindowRectangle (cp, window.Hwnd.menu, new Rectangle (Point.Empty, surfaceSize));
+			return new Size (Math.Max (1, windowRect.Width), Math.Max (1, windowRect.Height));
 		}
 
 		Rectangle GetClientLocalRectangle (WaylandWindow window)
