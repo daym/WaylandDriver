@@ -634,7 +634,7 @@ namespace System.Windows.Forms {
 				DestroyNativeWindow (window);
 			if (window.Hwnd.visible) {
 				EnsureNativeWindow (window);
-				Invalidate (handle, Rectangle.Empty, false);
+				InvalidateWindowTree (window);
 			}
 
 			return old;
@@ -762,8 +762,9 @@ namespace System.Windows.Forms {
 
 			int oldWidth = window.Hwnd.Width;
 			int oldHeight = window.Hwnd.Height;
+			bool movedOrResized = window.Hwnd.X != x || window.Hwnd.Y != y || oldWidth != width || oldHeight != height;
 			bool popupRolePositionChanged = window.XdgPopupId != 0 &&
-				(window.Hwnd.X != x || window.Hwnd.Y != y || oldWidth != width || oldHeight != height);
+				movedOrResized;
 
 			window.Hwnd.X = x;
 			window.Hwnd.Y = y;
@@ -776,15 +777,22 @@ namespace System.Windows.Forms {
 				// recreate the surface role so the compositor gets the new anchor.
 				DestroyNativeWindow (window);
 				EnsureNativeWindow (window);
+				InvalidateWindowTree (window);
 			}
 			UpdateSubsurfacePosition (window);
-			PostMessage (handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
+			// SetBoundsCore expects SetWindowPos to make Control.bounds current
+			// before returning.  PropertyGridView reuses one dropdown Form and
+			// reads Location immediately after assigning it; queueing this
+			// message leaves that read seeing the previous popup position.
+			SendMessage (handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
 
 			// A Wayland subsurface's visible extent is the last committed buffer
 			// size, not Mono's Hwnd bounds.  If a child grows without repainting,
 			// the compositor can keep showing the old narrower buffer even though
 			// WinForms layout has already changed the logical client size.
-			if (window.Hwnd.visible && (window.Hwnd.Width != oldWidth || window.Hwnd.Height != oldHeight))
+			if (window.Hwnd.visible && IsSubsurfaceWindow (window) && movedOrResized)
+				Invalidate (handle, Rectangle.Empty, false);
+			else if (window.Hwnd.visible && (window.Hwnd.Width != oldWidth || window.Hwnd.Height != oldHeight))
 				Invalidate (handle, Rectangle.Empty, false);
 		}
 
@@ -1422,7 +1430,10 @@ namespace System.Windows.Forms {
 
 		internal override void EndLoop (Thread thread)
 		{
-			PostQuitMessage (0);
+			// StartLoop/EndLoop bracket nested WinForms loops such as
+			// PropertyGrid drop-down editors.  Ending one of those loops must not
+			// post WM_QUIT; only Application.Exit/ExitThread should terminate the
+			// application message loop.
 		}
 
 		internal override void RequestNCRecalc (IntPtr hwnd)
@@ -1553,10 +1564,8 @@ namespace System.Windows.Forms {
 			if (parent.XdgSurfaceId == 0)
 				return;
 
-			window.SurfaceId = connection.AllocateId ();
-			window.XdgSurfaceId = connection.AllocateId ();
-			window.XdgPopupId = connection.AllocateId ();
-			uint positionerId = connection.AllocateId ();
+			window.SurfaceId = liveConnection.AllocateId ();
+			uint positionerId = liveConnection.AllocateId ();
 			window.BufferScale = parent.BufferScale;
 
 			Point parentScreen = GetWindowScreenLocation (parent);
@@ -1637,14 +1646,30 @@ namespace System.Windows.Forms {
 
 		void CommitWindowBuffer (WaylandWindow window)
 		{
-			if (connection == null || window.SurfaceId == 0)
+			if (window.SurfaceId == 0)
 				return;
 			if (window.XdgSurfaceId != 0 && !window.XdgConfigured)
 				return;
+			WaylandConnection liveConnection = RequireConnection ();
+			Rectangle sourceLogical = Rectangle.Empty;
+			Point surfacePosition = Point.Empty;
+			bool clippedSubsurface = false;
+
+			if (window.SubsurfaceId != 0) {
+				if (!TryGetSubsurfaceGeometry (window, out surfacePosition, out sourceLogical)) {
+					DetachSurfaceBuffer (window);
+					return;
+				}
+
+				SendSubsurfacePosition (window, surfacePosition);
+				Rectangle full = new Rectangle (0, 0, Math.Max (1, window.Hwnd.ClientRect.Width), Math.Max (1, window.Hwnd.ClientRect.Height));
+				clippedSubsurface = sourceLogical != full;
+			}
 
 			window.EnsureBackBuffer ();
 			Bitmap commitBitmap = window.BackBuffer;
 			Bitmap caretBitmap = null;
+			Bitmap clippedBitmap = null;
 
 			try {
 				if (caret.Hwnd == window.Hwnd.Handle && caret.Visible && caret.On) {
@@ -1717,6 +1742,22 @@ namespace System.Windows.Forms {
 			using (Brush brush = new SolidBrush (color)) {
 				graphics.FillRectangle (brush, rect);
 			}
+		}
+
+		static Bitmap CreateClippedCommitBitmap (Bitmap source, Rectangle logicalSource, int scale)
+		{
+			scale = Math.Max (1, scale);
+			Rectangle physicalSource = new Rectangle (logicalSource.X * scale, logicalSource.Y * scale,
+				Math.Max (1, logicalSource.Width * scale), Math.Max (1, logicalSource.Height * scale));
+			Bitmap bitmap = new Bitmap (physicalSource.Width, physicalSource.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+			bitmap.SetResolution (source.HorizontalResolution, source.VerticalResolution);
+
+			using (Graphics graphics = Graphics.FromImage (bitmap)) {
+				graphics.CompositingMode = CompositingMode.SourceCopy;
+				graphics.DrawImage (source, new Rectangle (0, 0, bitmap.Width, bitmap.Height), physicalSource, GraphicsUnit.Pixel);
+			}
+
+			return bitmap;
 		}
 
 		void EnsureCaretTimer ()
@@ -2457,15 +2498,15 @@ namespace System.Windows.Forms {
 			}
 
 			WaylandShmBuffer releasedBuffer;
-			if (waylandBuffers.TryGetValue (message.ObjectId, out releasedBuffer)) {
-				if (message.Opcode == WaylandProtocol.WlBuffer.Release) {
-					waylandBuffers.Remove (releasedBuffer.BufferId);
-					foreach (WaylandWindow candidate in windows.Values)
-						candidate.Buffers.Remove (releasedBuffer);
-					releasedBuffer.DestroyWaylandObject (connection);
+				if (waylandBuffers.TryGetValue (message.ObjectId, out releasedBuffer)) {
+					if (message.Opcode == WaylandProtocol.WlBuffer.Release) {
+						waylandBuffers.Remove (releasedBuffer.BufferId);
+						foreach (WaylandWindow candidate in windows.Values)
+							candidate.Buffers.Remove (releasedBuffer);
+						releasedBuffer.DestroyWaylandObject (RequireConnection ());
+					}
+					return;
 				}
-				return;
-			}
 
 			WaylandWindow window;
 			if (!waylandObjects.TryGetValue (message.ObjectId, out window))
@@ -2476,17 +2517,22 @@ namespace System.Windows.Forms {
 				return;
 			}
 
-			if (message.ObjectId == window.XdgSurfaceId && message.Opcode == WaylandProtocol.XdgSurface.Configure) {
-				WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
-				uint serial = reader.ReadUInt32 ();
-				connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.AckConfigure, delegate (WaylandRequestBuilder b) {
-					b.WriteUInt32 (serial);
-				});
-				window.XdgConfigured = true;
-				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
-				return;
-			}
+				if (message.ObjectId == window.XdgSurfaceId && message.Opcode == WaylandProtocol.XdgSurface.Configure) {
+					WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
+					uint serial = reader.ReadUInt32 ();
+					WaylandConnection liveConnection = RequireConnection ();
+					liveConnection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.AckConfigure, delegate (WaylandRequestBuilder b) {
+						b.WriteUInt32 (serial);
+					});
+					window.XdgConfigured = true;
+				// Popup forms such as PropertyGridDropDown host their real
+				// contents in child HWNDs.  When the compositor maps the popup
+					// role, repaint the whole HWND tree so child subsurfaces are
+					// committed after the parent popup is configured.
+					InvalidateWindowTree (window);
+					liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+					return;
+				}
 
 			if (message.ObjectId == window.XdgToplevelId) {
 				if (message.Opcode == WaylandProtocol.XdgToplevel.Configure) {
@@ -2583,8 +2629,17 @@ namespace System.Windows.Forms {
 				if (!waylandObjects.TryGetValue (surfaceId, out window))
 					return;
 
-				if (grabWindow == IntPtr.Zero)
-					PostPointerMessage (Msg.WM_MOUSELEAVE, window, pointerSurfacePosition.X, pointerSurfacePosition.Y, 0, CurrentMessageTime ());
+				if (grabWindow != IntPtr.Zero) {
+					// WinForms mouse capture keeps routing pointer messages to
+					// the grabbed HWND until Capture is released.  A compositor
+					// leave while that grab is active must not clear our current
+					// pointer surface; later button releases still need a live
+					// surface context before ResolvePointerTarget redirects them
+					// to grabWindow.
+					return;
+				}
+
+				PostPointerMessage (Msg.WM_MOUSELEAVE, window, pointerSurfacePosition.X, pointerSurfacePosition.Y, 0, CurrentMessageTime ());
 				if (pointerWindow == window) {
 					pointerWindow = null;
 					pointerEnterSerial = 0;
@@ -2645,7 +2700,7 @@ namespace System.Windows.Forms {
 
 			if (state == WaylandProtocol.WlPointer.ButtonStatePressed) {
 				ActivateForInput (target);
-				SetFocusWindow (target.Hwnd.Handle);
+				SetFocusWindow (GetPointerFocusWindow (target));
 				SendParentNotify (target.Hwnd.Handle, down, targetX, targetY);
 				Msg message = IsDoubleClick (target.Hwnd.Handle, down, targetX, targetY, time) ? dblclk : down;
 				PostInputMessage (target.Hwnd.Handle, message, (IntPtr) MakeMouseWParam (0), Control.MakeParam (targetX, targetY), time);
@@ -2919,21 +2974,58 @@ namespace System.Windows.Forms {
 			return window.Hwnd.Parent != null || StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_CHILD);
 		}
 
+		bool HasPopupStyle (WaylandWindow window)
+		{
+			return StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_POPUP);
+		}
+
 		bool IsPopupWindow (WaylandWindow window)
 		{
-			return window.Hwnd.owner != null && StyleSet ((int) window.Hwnd.initial_style, WindowStyles.WS_POPUP);
+			return HasPopupStyle (window) && GetPopupParentWindow (window) != null;
+		}
+
+		bool ShouldDeferUnownedPopup (WaylandWindow window)
+		{
+			if (!HasPopupStyle (window) || IsPopupWindow (window))
+				return false;
+
+			Control control = Control.FromHandle (window.Hwnd.Handle);
+			return control != null && !(control is Form);
 		}
 
 		WaylandWindow GetPopupParentWindow (WaylandWindow window)
 		{
-			if (window.Hwnd.owner == null)
+			WaylandWindow owner = GetPopupOwnerWindow (window);
+			return owner != null ? GetRootWindow (owner) : null;
+		}
+
+		WaylandWindow GetPopupOwnerWindow (WaylandWindow window)
+		{
+			if (!HasPopupStyle (window))
 				return null;
 
-			WaylandWindow parent;
-			if (!windows.TryGetValue (window.Hwnd.owner.Handle, out parent))
-				return null;
+			if (window.Hwnd.owner != null) {
+				WaylandWindow owner;
+				if (!windows.TryGetValue (window.Hwnd.owner.Handle, out owner))
+					return null;
 
-			return GetRootWindow (parent);
+				return owner;
+			}
+
+			Control control = Control.FromHandle (window.Hwnd.Handle);
+			MonthCalendar calendar = control as MonthCalendar;
+			if (calendar != null && calendar.owner != null && calendar.owner.IsHandleCreated) {
+				// DateTimePicker creates its drop-down MonthCalendar as a
+				// managed top-level WS_POPUP and records the owner on the
+				// MonthCalendar instead of calling XplatUI.SetOwner.  Wayland
+				// still needs the owner xdg_surface to make this an xdg_popup
+				// rather than a separate application toplevel.
+				WaylandWindow owner;
+				if (windows.TryGetValue (calendar.owner.Handle, out owner))
+					return owner;
+			}
+
+			return null;
 		}
 
 		WaylandWindow GetRootWindow (WaylandWindow window)
@@ -2967,6 +3059,76 @@ namespace System.Windows.Forms {
 			return new Point (x, y);
 		}
 
+		bool TryGetSubsurfaceGeometry (WaylandWindow window, out Point surfacePosition, out Rectangle sourceLogical)
+		{
+			sourceLogical = Rectangle.Empty;
+			surfacePosition = new Point (window.Hwnd.X, window.Hwnd.Y);
+
+			WaylandWindow immediateParent = GetParentWindow (window);
+			if (immediateParent == null)
+				return false;
+
+			Point childScreen = GetWindowScreenLocation (window);
+			Rectangle visibleScreen = new Rectangle (childScreen.X, childScreen.Y,
+				Math.Max (1, window.Hwnd.ClientRect.Width), Math.Max (1, window.Hwnd.ClientRect.Height));
+
+			Hwnd parentHwnd = window.Hwnd.Parent;
+			while (parentHwnd != null) {
+				WaylandWindow parent;
+				if (!windows.TryGetValue (parentHwnd.Handle, out parent))
+					return false;
+
+				Point parentScreen = GetWindowScreenLocation (parent);
+				Rectangle parentClient = parent.Hwnd.ClientRect;
+				// The Wayland surface we commit is the Mono client buffer,
+				// whose logical origin is always 0,0 even when Hwnd.ClientRect
+				// has a non-client offset in Mono's window bookkeeping.
+				Rectangle parentClip = new Rectangle (parentScreen.X, parentScreen.Y,
+					Math.Max (0, parentClient.Width), Math.Max (0, parentClient.Height));
+				visibleScreen = Rectangle.Intersect (visibleScreen, parentClip);
+				if (visibleScreen.Width <= 0 || visibleScreen.Height <= 0)
+					return false;
+
+				parentHwnd = parent.Hwnd.Parent;
+			}
+
+			sourceLogical = new Rectangle (visibleScreen.X - childScreen.X, visibleScreen.Y - childScreen.Y,
+				visibleScreen.Width, visibleScreen.Height);
+			// If the parent is itself clipped, its committed surface origin is
+			// already shifted to the parent's visible source rectangle.  Child
+			// subsurface positions are relative to that committed surface.
+			Point parentOrigin = GetSurfaceScreenLocation (immediateParent);
+			surfacePosition = new Point (visibleScreen.X - parentOrigin.X, visibleScreen.Y - parentOrigin.Y);
+			return true;
+		}
+
+		Point GetSurfaceScreenLocation (WaylandWindow window)
+		{
+			if (window.SubsurfaceId != 0) {
+				Point surfacePosition;
+				Rectangle sourceLogical;
+				if (TryGetSubsurfaceGeometry (window, out surfacePosition, out sourceLogical)) {
+					Point windowOrigin = GetWindowScreenLocation (window);
+					return new Point (windowOrigin.X + sourceLogical.X, windowOrigin.Y + sourceLogical.Y);
+				}
+			}
+
+			return GetWindowScreenLocation (window);
+		}
+
+		void TranslateSurfacePointToWindow (WaylandWindow window, ref int x, ref int y)
+		{
+			if (window.SubsurfaceId == 0)
+				return;
+
+			Point surfacePosition;
+			Rectangle sourceLogical;
+			if (TryGetSubsurfaceGeometry (window, out surfacePosition, out sourceLogical)) {
+				x += sourceLogical.X;
+				y += sourceLogical.Y;
+			}
+		}
+
 		void SetFocusWindow (IntPtr hwnd)
 		{
 			if (hwnd != IntPtr.Zero && !windows.ContainsKey (hwnd))
@@ -2984,7 +3146,7 @@ namespace System.Windows.Forms {
 
 		void ActivateForInput (WaylandWindow window)
 		{
-			WaylandWindow active = IsPopupWindow (window) ? GetPopupParentWindow (window) : GetRootWindow (window);
+			WaylandWindow active = GetActivationWindow (window);
 			if (active == null)
 				return;
 
@@ -2999,6 +3161,26 @@ namespace System.Windows.Forms {
 			PostMessage (handle, Msg.WM_ACTIVATE, (IntPtr) WindowActiveFlags.WA_ACTIVE, oldActive);
 		}
 
+		WaylandWindow GetActivationWindow (WaylandWindow window)
+		{
+			WaylandWindow root = GetRootWindow (window);
+			if (root == null)
+				return null;
+
+			if (IsPopupWindow (root)) {
+				// WinForms owned popups are transient UI for their owner, not
+				// independent active forms.  Child controls inside a popup must
+				// keep the owner active; otherwise PropertyGridView sees its
+				// owner receive WM_ACTIVATE/WA_INACTIVE and closes the dropdown
+				// while processing an inside click such as a tab or scrollbar.
+				WaylandWindow parent = GetPopupParentWindow (root);
+				if (parent != null)
+					return parent;
+			}
+
+			return root;
+		}
+
 		bool FocusBelongsToSurfaceTree (WaylandWindow surfaceWindow)
 		{
 			WaylandWindow focused;
@@ -3010,10 +3192,30 @@ namespace System.Windows.Forms {
 			return focusedRoot != null && focusedRoot == surfaceRoot;
 		}
 
+		IntPtr GetPointerFocusWindow (WaylandWindow target)
+		{
+			WaylandWindow root = GetRootWindow (target);
+			if (root != null && IsPopupWindow (root)) {
+				Control control = Control.FromHandle (target.Hwnd.Handle);
+				if (control != null && !control.ActivateOnShow) {
+					// ComboBox transfers mouse capture to its ComboListBox
+					// popup after opening.  That grab, not focus, owns the mouse
+					// stream: WM_LBUTTONUP on the popup commits the clicked item,
+					// while WM_KILLFOCUS on the owner dismisses the list first.
+					// Keep focus on the logical owner while the grabbed popup
+					// receives the pointer messages.
+					WaylandWindow owner = GetPopupOwnerWindow (root);
+					return owner != null ? owner.Hwnd.Handle : focusWindow;
+				}
+			}
+
+			return target.Hwnd.Handle;
+		}
+
 		void UpdatePointerPosition (WaylandWindow window, int x, int y)
 		{
 			pointerSurfacePosition = new Point (x, y);
-			Point origin = GetWindowScreenLocation (window);
+			Point origin = GetSurfaceScreenLocation (window);
 			mousePosition = new Point (origin.X + x, origin.Y + y);
 		}
 
@@ -3022,6 +3224,7 @@ namespace System.Windows.Forms {
 			WaylandWindow target = surfaceWindow;
 			targetX = surfaceX;
 			targetY = surfaceY;
+			TranslateSurfacePointToWindow (surfaceWindow, ref targetX, ref targetY);
 
 			if (grabWindow != IntPtr.Zero) {
 				if (!windows.TryGetValue (grabWindow, out target))
@@ -3107,6 +3310,14 @@ namespace System.Windows.Forms {
 			Control control = Control.FromHandle (window.Hwnd.Handle);
 			if (control == null) {
 				PostMessage (window.Hwnd.Handle, Msg.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+				return;
+			}
+
+			MonthCalendar calendar = control as MonthCalendar;
+			if (calendar != null && calendar.owner != null) {
+				// The DateTimePicker owns the drop-down state.  Hiding only the
+				// MonthCalendar would leave the picker thinking it is still open.
+				calendar.owner.HideMonthCalendar ();
 				return;
 			}
 
@@ -3337,9 +3548,22 @@ namespace System.Windows.Forms {
 			if (window.SubsurfaceId == 0)
 				return;
 
-			connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.SetPosition, delegate (WaylandRequestBuilder b) {
-				b.WriteInt32 (window.Hwnd.X);
-				b.WriteInt32 (window.Hwnd.Y);
+			Point surfacePosition;
+			Rectangle sourceLogical;
+			if (!TryGetSubsurfaceGeometry (window, out surfacePosition, out sourceLogical)) {
+				DetachSurfaceBuffer (window);
+				return;
+			}
+
+			SendSubsurfacePosition (window, surfacePosition);
+		}
+
+		void SendSubsurfacePosition (WaylandWindow window, Point surfacePosition)
+		{
+			WaylandConnection liveConnection = RequireConnection ();
+			liveConnection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.SetPosition, delegate (WaylandRequestBuilder b) {
+				b.WriteInt32 (surfacePosition.X);
+				b.WriteInt32 (surfacePosition.Y);
 			});
 		}
 
