@@ -9,6 +9,7 @@ namespace WaylandDriver.Wayland {
 	internal sealed class WaylandConnection : IDisposable {
 		readonly Socket socket;
 		readonly object writeLock = new object ();
+		readonly Queue<int> pendingFds = new Queue<int> ();
 		uint nextObjectId = 2;
 		bool disposed;
 
@@ -94,8 +95,7 @@ namespace WaylandDriver.Wayland {
 			if (timeoutMilliseconds >= 0 && !socket.Poll (timeoutMilliseconds * 1000, SelectMode.SelectRead))
 				return false;
 
-			List<int> fds = new List<int> ();
-			byte [] header = ReadExactly (8, fds);
+			byte [] header = ReadExactly (8);
 			uint objectId = ReadUInt32 (header, 0);
 			uint second = ReadUInt32 (header, 4);
 			ushort opcode = (ushort) (second & 0xffff);
@@ -104,8 +104,23 @@ namespace WaylandDriver.Wayland {
 			if (size < 8)
 				throw new InvalidDataException ("Invalid Wayland message size.");
 
-			message = new WaylandMessage (objectId, opcode, ReadExactly (size - 8, fds), fds.ToArray ());
+			message = new WaylandMessage (objectId, opcode, ReadExactly (size - 8), new int [0]);
 			return true;
+		}
+
+		public bool TryTakeFd (out int fd)
+		{
+			if (pendingFds.Count == 0) {
+				fd = -1;
+				return false;
+			}
+
+			fd = pendingFds.Dequeue ();
+			return true;
+		}
+
+		public int PendingFdCount {
+			get { return pendingFds.Count; }
 		}
 
 		public WaylandRegistry GetRegistryRoundtrip ()
@@ -185,12 +200,12 @@ namespace WaylandDriver.Wayland {
 			return Path.Combine (runtimeDir, display);
 		}
 
-		byte [] ReadExactly (int count, List<int> fds)
+		byte [] ReadExactly (int count)
 		{
 			byte [] buffer = new byte [count];
 			int offset = 0;
 			while (offset < count) {
-				int n = ReceiveSome (buffer, offset, count - offset, fds);
+				int n = ReceiveSome (buffer, offset, count - offset);
 				if (n == 0)
 					throw new EndOfStreamException ("Wayland compositor closed the connection.");
 				offset += n;
@@ -198,7 +213,7 @@ namespace WaylandDriver.Wayland {
 			return buffer;
 		}
 
-		unsafe int ReceiveSome (byte [] buffer, int offset, int count, List<int> fds)
+		unsafe int ReceiveSome (byte [] buffer, int offset, int count)
 		{
 			byte [] control = new byte [checked ((int) Syscall.CMSG_SPACE (sizeof (int) * 8))];
 			Msghdr message = new Msghdr {
@@ -219,12 +234,12 @@ namespace WaylandDriver.Wayland {
 				if (received < 0)
 					UnixMarshal.ThrowExceptionForLastError ();
 
-				ReadReceivedFds (message, fds);
+				ReadReceivedFds (message);
 				return (int) received;
 			}
 		}
 
-		unsafe static void ReadReceivedFds (Msghdr message, List<int> fds)
+		unsafe void ReadReceivedFds (Msghdr message)
 		{
 			long offset = Syscall.CMSG_FIRSTHDR (message);
 			while (offset != -1) {
@@ -238,7 +253,7 @@ namespace WaylandDriver.Wayland {
 					fixed (byte* controlPtr = message.msg_control) {
 						int* fdPtr = (int*) (controlPtr + dataOffset);
 						for (int i = 0; i < byteCount / sizeof (int); i++)
-							fds.Add (fdPtr [i]);
+							pendingFds.Enqueue (fdPtr [i]);
 					}
 				}
 
