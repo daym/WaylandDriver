@@ -57,6 +57,14 @@ namespace System.Windows.Forms {
 			}
 		}
 
+		// Wayland input serials are valid only for the input event that carried
+		// them.  Keep the serial attached to Mono's queued MSG so popup grabs
+		// use the event being dispatched, not a later event already read ahead.
+		sealed class QueuedInputMessage {
+			public MSG Message;
+			public uint Serial;
+		}
+
 		sealed class WaylandOutput {
 			public uint ObjectId;
 			public int Scale = 1;
@@ -3113,6 +3121,8 @@ namespace System.Windows.Forms {
 		uint cursorShapeManagerId;
 		uint cursorShapeDeviceId;
 		uint lastInputSerial;
+		uint nextDispatchInputSerial;
+		uint currentDispatchInputSerial;
 		uint pointerEnterSerial;
 		uint cursorSurfaceId;
 		int nextHandle = 0x4000;
@@ -3883,7 +3893,15 @@ namespace System.Windows.Forms {
 				return PeekMessage (queueId, ref msg, hWnd, wFilterMin, wFilterMax, flags);
 			}
 
+			QueuedInputMessage input = item as QueuedInputMessage;
+			if (input != null) {
+				msg = input.Message;
+				nextDispatchInputSerial = input.Serial;
+				return true;
+			}
+
 			msg = (MSG) item;
+			nextDispatchInputSerial = 0;
 			return true;
 		}
 
@@ -3948,7 +3966,15 @@ namespace System.Windows.Forms {
 		{
 			if (msg.message == Msg.WM_QUIT)
 				return IntPtr.Zero;
-			return NativeWindow.WndProc (msg.hwnd, msg.message, msg.wParam, msg.lParam);
+
+			uint previousSerial = currentDispatchInputSerial;
+			currentDispatchInputSerial = nextDispatchInputSerial;
+			nextDispatchInputSerial = 0;
+			try {
+				return NativeWindow.WndProc (msg.hwnd, msg.message, msg.wParam, msg.lParam);
+			} finally {
+				currentDispatchInputSerial = previousSerial;
+			}
 		}
 
 		internal override bool SetZOrder (IntPtr hWnd, IntPtr afterHWnd, bool top, bool bottom)
@@ -5114,14 +5140,16 @@ namespace System.Windows.Forms {
 				b.WriteObject (positionerId);
 			});
 			liveConnection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.Destroy, null);
-			if (seatId != 0 && lastInputSerial != 0) {
+			if (seatId != 0 && currentDispatchInputSerial != 0) {
 				// The xdg_popup grab is tied to a user-input serial by design;
-				// without that serial the compositor must reject the grab.  The
-				// popup still maps, but outside-click dismissal is compositor
-				// managed only for user-triggered popups.
+				// it must be the serial for the event currently opening this
+				// popup, not merely the newest event drained from the Wayland
+				// socket into Mono's queue.  The popup still maps without a
+				// serial, but outside-click dismissal is compositor managed only
+				// for user-triggered popups.
 				liveConnection.SendRequest (window.XdgPopupId, WaylandProtocol.XdgPopup.Grab, delegate (WaylandRequestBuilder b) {
 					b.WriteObject (seatId);
-					b.WriteUInt32 (lastInputSerial);
+					b.WriteUInt32 (currentDispatchInputSerial);
 				});
 			}
 			liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
@@ -6210,14 +6238,14 @@ namespace System.Windows.Forms {
 				SetFocusWindow (GetPointerFocusWindow (target));
 				SendParentNotify (target.Hwnd.Handle, down, targetX, targetY);
 				Msg message = IsDoubleClick (target.Hwnd.Handle, down, targetX, targetY, time) ? dblclk : down;
-				PostInputMessage (target.Hwnd.Handle, message, (IntPtr) MakeMouseWParam (0), Control.MakeParam (targetX, targetY), time);
+				PostInputMessage (target.Hwnd.Handle, message, (IntPtr) MakeMouseWParam (0), Control.MakeParam (targetX, targetY), time, lastInputSerial);
 				lastClickWindow = target.Hwnd.Handle;
 				lastClickMessage = down;
 				lastClickX = targetX;
 				lastClickY = targetY;
 				lastClickTime = time;
 			} else {
-				PostInputMessage (target.Hwnd.Handle, up, (IntPtr) MakeMouseWParam (0), Control.MakeParam (targetX, targetY), time);
+				PostInputMessage (target.Hwnd.Handle, up, (IntPtr) MakeMouseWParam (0), Control.MakeParam (targetX, targetY), time, lastInputSerial);
 			}
 		}
 
@@ -6445,7 +6473,7 @@ namespace System.Windows.Forms {
 			MSG msg = CreateInputMessage (target, message, (IntPtr) key, lParam, time);
 			if (pressed && !String.IsNullOrEmpty (result.Text))
 				keyText [GetKeyTextKey (msg)] = result.Text;
-			EnqueueMessage (msg);
+			EnqueueInputMessage (msg, lastInputSerial);
 		}
 
 		void HandlePopupMessage (WaylandWindow window, WaylandMessage message)
@@ -6619,6 +6647,13 @@ namespace System.Windows.Forms {
 			}
 
 			Control control = Control.FromHandle (window.Hwnd.Handle);
+			ToolStripDropDown dropDown = control as ToolStripDropDown;
+			if (dropDown != null) {
+				WaylandWindow owner = GetToolStripDropDownOwnerWindow (dropDown);
+				if (owner != null)
+					return owner;
+			}
+
 			if (control is PopUpWindow) {
 				WaylandWindow owner = GetActiveMenuPopupOwnerWindow ();
 				if (owner != null)
@@ -6635,6 +6670,32 @@ namespace System.Windows.Forms {
 				WaylandWindow owner;
 				if (windows.TryGetValue (calendar.owner.Handle, out owner))
 					return owner;
+			}
+
+			return null;
+		}
+
+		WaylandWindow GetToolStripDropDownOwnerWindow (ToolStripDropDown dropDown)
+		{
+			ToolStripItem ownerItem = dropDown.OwnerItem;
+			while (ownerItem != null) {
+				ToolStrip ownerStrip = ownerItem.Owner ?? ownerItem.GetCurrentParent ();
+				if (ownerStrip == null)
+					return null;
+
+				if (ownerStrip.IsHandleCreated) {
+					WaylandWindow owner;
+					if (windows.TryGetValue (ownerStrip.Handle, out owner))
+						return owner;
+				}
+
+				// Nested ToolStripDropDown menus are parented to the popup that
+				// owns their item.  Top-level menu items stop at the MenuStrip,
+				// whose root surface becomes the xdg_popup parent.
+				ToolStripDropDown parentDropDown = ownerStrip as ToolStripDropDown;
+				if (parentDropDown == null)
+					return null;
+				ownerItem = parentDropDown.OwnerItem;
 			}
 
 			return null;
@@ -6977,6 +7038,19 @@ namespace System.Windows.Forms {
 		void PostInputMessage (IntPtr hwnd, Msg message, IntPtr wParam, IntPtr lParam, uint time)
 		{
 			EnqueueMessage (CreateInputMessage (hwnd, message, wParam, lParam, time));
+		}
+
+		void PostInputMessage (IntPtr hwnd, Msg message, IntPtr wParam, IntPtr lParam, uint time, uint serial)
+		{
+			EnqueueInputMessage (CreateInputMessage (hwnd, message, wParam, lParam, time), serial);
+		}
+
+		void EnqueueInputMessage (MSG msg, uint serial)
+		{
+			QueuedInputMessage input = new QueuedInputMessage ();
+			input.Message = msg;
+			input.Serial = serial;
+			EnqueueMessage (input);
 		}
 
 		MSG CreateInputMessage (IntPtr hwnd, Msg message, IntPtr wParam, IntPtr lParam, uint time)
