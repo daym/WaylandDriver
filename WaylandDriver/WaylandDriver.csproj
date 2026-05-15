@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{3D52F23C-0CE6-493E-8E7D-F0F7475C3C1A}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <RootNamespace>WaylandDriver</RootNamespace>
+    <AssemblyName>CocoaDriver</AssemblyName>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>..\..\CocoaDriver\CocoaKey.snk</AssemblyOriginatorKeyFile>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug</OutputPath>
+    <DefineConstants>DEBUG;</DefineConstants>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release</OutputPath>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms">
+      <HintPath>$(MSBuildFrameworkToolsPath)/System.Windows.Forms.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Mono.Posix" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Bootstrap.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="Wayland\WaylandConnection.cs" />
+    <Compile Include="Wayland\WaylandMessage.cs" />
+    <Compile Include="Wayland\WaylandRegistry.cs" />
+    <Compile Include="XplatUIWayland.cs" />
+  </ItemGroup>
+  <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
+  <Target Name="CoreCompile" Inputs="@(Compile)" Outputs="$(IntermediateOutputPath)$(AssemblyName).dll">
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Exec Command="mcs -target:library -out:&quot;$(IntermediateOutputPath)$(AssemblyName).dll&quot; -keyfile:&quot;$(AssemblyOriginatorKeyFile)&quot; -r:System -r:System.Core -r:System.Drawing -r:System.Windows.Forms -r:Mono.Posix @(Compile->'&quot;%(FullPath)&quot;', ' ')" />
+  </Target>
+</Project>
