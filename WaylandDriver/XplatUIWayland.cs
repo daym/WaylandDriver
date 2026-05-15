@@ -2421,7 +2421,7 @@ namespace System.Windows.Forms {
 				if (token.Kind == TokenKind.Number) {
 					if (!String.IsNullOrEmpty (token.Text) && token.Text.Length == 1 && Char.IsDigit (token.Text [0]))
 						return TryCreateSymbol (token.Text, out symbol);
-					symbol = SymbolFromCodepoint (token.Number, token.Text);
+					symbol = SymbolFromNumericKeysym (token.Number, token.Text);
 					return true;
 				}
 
@@ -2463,6 +2463,18 @@ namespace System.Windows.Forms {
 
 				XkbSymbol symbol = SymbolFromCodepoint (codepoint, text);
 				symbol.Text = text;
+				return symbol;
+			}
+
+			static XkbSymbol SymbolFromNumericKeysym (uint keysym, string name)
+			{
+				XkbSymbol symbol = NoSymbol ();
+				if (keysym == 0)
+					return symbol;
+				symbol.NoSymbol = false;
+				symbol.Name = name;
+				symbol.Keysym = keysym;
+				symbol.Text = TextFromKeysym (keysym);
 				return symbol;
 			}
 
