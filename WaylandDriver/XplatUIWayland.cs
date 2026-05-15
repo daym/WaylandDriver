@@ -173,6 +173,13 @@ namespace System.Windows.Forms {
 
 		internal override event EventHandler Idle;
 
+		WaylandConnection RequireConnection ()
+		{
+			if (connection == null)
+				throw new InvalidOperationException ("The Wayland connection is closed.");
+			return connection;
+		}
+
 		internal override int CaptionHeight {
 			get { return 22; }
 		}
@@ -295,16 +302,21 @@ namespace System.Windows.Forms {
 
 		internal override void ShutdownDriver (IntPtr token)
 		{
+			WaylandConnection closingConnection = connection;
+			connection = null;
+
 			foreach (WaylandWindow window in windows.Values)
 				window.Dispose ();
 			foreach (WaylandShmBuffer buffer in waylandBuffers.Values)
 				buffer.Dispose ();
-			if (cursorShapeDeviceId != 0 && connection != null)
-				connection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.Destroy, null);
-			if (cursorShapeManagerId != 0 && connection != null)
-				connection.SendRequest (cursorShapeManagerId, WaylandProtocol.WpCursorShapeManagerV1.Destroy, null);
-			if (cursorSurfaceId != 0 && connection != null)
-				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Destroy, null);
+			if (closingConnection != null) {
+				if (cursorShapeDeviceId != 0)
+					closingConnection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.Destroy, null);
+				if (cursorShapeManagerId != 0)
+					closingConnection.SendRequest (cursorShapeManagerId, WaylandProtocol.WpCursorShapeManagerV1.Destroy, null);
+				if (cursorSurfaceId != 0)
+					closingConnection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Destroy, null);
+			}
 			foreach (WaylandCursor cursor in cursors.Values) {
 				if (cursor.Bitmap != null)
 					cursor.Bitmap.Dispose ();
@@ -327,8 +339,6 @@ namespace System.Windows.Forms {
 			cursorSurfaceCommitted = false;
 			renderedCursor = IntPtr.Zero;
 
-			WaylandConnection closingConnection = connection;
-			connection = null;
 			if (closingConnection != null)
 				closingConnection.Dispose ();
 		}
@@ -423,7 +433,6 @@ namespace System.Windows.Forms {
 			if (!windows.TryGetValue (handle, out window))
 				return;
 
-			DestroyChildNativeWindows (window);
 			DestroyCaret (handle);
 			DestroyNativeWindow (window);
 			SendMessage (handle, Msg.WM_DESTROY, IntPtr.Zero, IntPtr.Zero);
@@ -461,12 +470,13 @@ namespace System.Windows.Forms {
 			if (window.XdgToplevelId == 0)
 				return;
 
+			WaylandConnection liveConnection = RequireConnection ();
 			if (state == FormWindowState.Maximized) {
-				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMaximized, null);
+				liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMaximized, null);
 			} else if (state == FormWindowState.Minimized) {
-				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinimized, null);
+				liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinimized, null);
 			} else {
-				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.UnsetMaximized, null);
+				liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.UnsetMaximized, null);
 			}
 		}
 
@@ -476,11 +486,12 @@ namespace System.Windows.Forms {
 			if (!windows.TryGetValue (handle, out window) || window.XdgToplevelId == 0)
 				return;
 
-			connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinSize, delegate (WaylandRequestBuilder b) {
+			WaylandConnection liveConnection = RequireConnection ();
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMinSize, delegate (WaylandRequestBuilder b) {
 				b.WriteInt32 (min.Width);
 				b.WriteInt32 (min.Height);
 			});
-			connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMaxSize, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetMaxSize, delegate (WaylandRequestBuilder b) {
 				b.WriteInt32 (max.Width);
 				b.WriteInt32 (max.Height);
 			});
@@ -554,7 +565,8 @@ namespace System.Windows.Forms {
 
 			window.Text = text ?? String.Empty;
 			if (window.XdgToplevelId != 0) {
-				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetTitle, delegate (WaylandRequestBuilder b) {
+				WaylandConnection liveConnection = RequireConnection ();
+				liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetTitle, delegate (WaylandRequestBuilder b) {
 					b.WriteString (window.Text);
 				});
 			}
@@ -1436,8 +1448,10 @@ namespace System.Windows.Forms {
 
 		void EnsureNativeWindow (WaylandWindow window)
 		{
-			if (window.SurfaceId != 0 || connection == null)
+			if (window.SurfaceId != 0)
 				return;
+
+			WaylandConnection liveConnection = RequireConnection ();
 
 			// WinForms child HWNDs are native child windows, not independent
 			// desktop windows.  Model them as subsurfaces attached to the parent
@@ -1451,29 +1465,29 @@ namespace System.Windows.Forms {
 				if (parent.SurfaceId == 0)
 					return;
 
-				window.SurfaceId = connection.AllocateId ();
-				window.SubsurfaceId = connection.AllocateId ();
+				window.SurfaceId = liveConnection.AllocateId ();
+				window.SubsurfaceId = liveConnection.AllocateId ();
 				// Parent and child must share one logical coordinate system.
 				// Scaling only changes buffer density, never child bounds.
 				window.BufferScale = parent.BufferScale;
 
-				connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
 					b.WriteNewId (window.SurfaceId);
 				});
-				connection.SendRequest (subcompositorId, WaylandProtocol.WlSubcompositor.GetSubsurface, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (subcompositorId, WaylandProtocol.WlSubcompositor.GetSubsurface, delegate (WaylandRequestBuilder b) {
 					b.WriteNewId (window.SubsurfaceId);
 					b.WriteObject (window.SurfaceId);
 					b.WriteObject (parent.SurfaceId);
 				});
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
 					b.WriteInt32 (window.BufferScale);
 				});
 				UpdateSubsurfacePosition (window);
 				// Mono paints HWNDs independently.  Desync lets a child commit its
 				// new buffer without waiting for an explicit parent commit.
-				connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.SetDesync, null);
+				liveConnection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.SetDesync, null);
 				ApplySubsurfaceZOrder (window, IntPtr.Zero, true, false);
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
 
 				waylandObjects [window.SurfaceId] = window;
 				waylandObjects [window.SubsurfaceId] = window;
@@ -1485,30 +1499,30 @@ namespace System.Windows.Forms {
 				return;
 			}
 
-			window.SurfaceId = connection.AllocateId ();
-			window.XdgSurfaceId = connection.AllocateId ();
-			window.XdgToplevelId = connection.AllocateId ();
+			window.SurfaceId = liveConnection.AllocateId ();
+			window.XdgSurfaceId = liveConnection.AllocateId ();
+			window.XdgToplevelId = liveConnection.AllocateId ();
 
-			connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.SurfaceId);
 			});
-			connection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.GetXdgSurface, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.GetXdgSurface, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.XdgSurfaceId);
 				b.WriteObject (window.SurfaceId);
 			});
-			connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.GetToplevel, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.GetToplevel, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.XdgToplevelId);
 			});
-			connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetTitle, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetTitle, delegate (WaylandRequestBuilder b) {
 				b.WriteString (window.Text);
 			});
-			connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetAppId, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.SetAppId, delegate (WaylandRequestBuilder b) {
 				b.WriteString ("mono-winforms");
 			});
-			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
 				b.WriteInt32 (window.BufferScale);
 			});
-			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+			liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
 
 			waylandObjects [window.SurfaceId] = window;
 			waylandObjects [window.XdgSurfaceId] = window;
@@ -1517,6 +1531,7 @@ namespace System.Windows.Forms {
 
 		void CreatePopupNativeWindow (WaylandWindow window)
 		{
+			WaylandConnection liveConnection = RequireConnection ();
 			WaylandWindow parent = GetPopupParentWindow (window);
 			if (parent == null)
 				return;
@@ -1538,33 +1553,32 @@ namespace System.Windows.Forms {
 			int width = Math.Max (1, window.Hwnd.Width);
 			int height = Math.Max (1, window.Hwnd.Height);
 
-			connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.SurfaceId);
 			});
-			connection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.GetXdgSurface, delegate (WaylandRequestBuilder b) {
-				b.WriteNewId (window.XdgSurfaceId);
-				b.WriteObject (window.SurfaceId);
-			});
-			connection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.CreatePositioner, delegate (WaylandRequestBuilder b) {
+			// xdg_popup gets all placement state from an xdg_positioner.
+			// Build that object before assigning the popup role, and keep each
+			// new_id allocation next to the request that introduces it on the wire.
+			liveConnection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.CreatePositioner, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (positionerId);
 			});
-			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetSize, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetSize, delegate (WaylandRequestBuilder b) {
 				b.WriteInt32 (width);
 				b.WriteInt32 (height);
 			});
-			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetAnchorRect, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetAnchorRect, delegate (WaylandRequestBuilder b) {
 				b.WriteInt32 (relativeX);
 				b.WriteInt32 (relativeY);
 				b.WriteInt32 (1);
 				b.WriteInt32 (1);
 			});
-			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetAnchor, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetAnchor, delegate (WaylandRequestBuilder b) {
 				b.WriteUInt32 (WaylandProtocol.XdgPositioner.AnchorTopLeft);
 			});
-			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetGravity, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetGravity, delegate (WaylandRequestBuilder b) {
 				b.WriteUInt32 (WaylandProtocol.XdgPositioner.GravityBottomRight);
 			});
-			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetConstraintAdjustment, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.SetConstraintAdjustment, delegate (WaylandRequestBuilder b) {
 				b.WriteUInt32 (WaylandProtocol.XdgPositioner.ConstraintAdjustmentSlideX |
 					WaylandProtocol.XdgPositioner.ConstraintAdjustmentSlideY |
 					WaylandProtocol.XdgPositioner.ConstraintAdjustmentFlipX |
@@ -1572,30 +1586,36 @@ namespace System.Windows.Forms {
 					WaylandProtocol.XdgPositioner.ConstraintAdjustmentResizeX |
 					WaylandProtocol.XdgPositioner.ConstraintAdjustmentResizeY);
 			});
+			window.XdgSurfaceId = liveConnection.AllocateId ();
+			liveConnection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.GetXdgSurface, delegate (WaylandRequestBuilder b) {
+				b.WriteNewId (window.XdgSurfaceId);
+				b.WriteObject (window.SurfaceId);
+			});
 			// Owned WinForms popup HWNDs are not independent application
 			// windows.  xdg_popup gives the compositor the same relationship
 			// that Mono expresses through Hwnd.owner, including outside-click
 			// dismissal for grabbed popup menus and combo lists.
-			connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.GetPopup, delegate (WaylandRequestBuilder b) {
+			window.XdgPopupId = liveConnection.AllocateId ();
+			liveConnection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.GetPopup, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (window.XdgPopupId);
 				b.WriteObject (parent.XdgSurfaceId);
 				b.WriteObject (positionerId);
 			});
-			connection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.Destroy, null);
+			liveConnection.SendRequest (positionerId, WaylandProtocol.XdgPositioner.Destroy, null);
 			if (seatId != 0 && lastInputSerial != 0) {
 				// The xdg_popup grab is tied to a user-input serial by design;
 				// without that serial the compositor must reject the grab.  The
 				// popup still maps, but outside-click dismissal is compositor
 				// managed only for user-triggered popups.
-				connection.SendRequest (window.XdgPopupId, WaylandProtocol.XdgPopup.Grab, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (window.XdgPopupId, WaylandProtocol.XdgPopup.Grab, delegate (WaylandRequestBuilder b) {
 					b.WriteObject (seatId);
 					b.WriteUInt32 (lastInputSerial);
 				});
 			}
-			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
 				b.WriteInt32 (window.BufferScale);
 			});
-			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+			liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
 
 			waylandObjects [window.SurfaceId] = window;
 			waylandObjects [window.XdgSurfaceId] = window;
@@ -1623,29 +1643,41 @@ namespace System.Windows.Forms {
 					commitBitmap = caretBitmap;
 				}
 
-				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (connection, shmId, commitBitmap, window.BufferScale);
+				if (clippedSubsurface) {
+					// Wayland subsurfaces are not clipped by their parent
+					// surface.  Native WinForms child HWNDs are, so commit only
+					// the parent-visible source rectangle and move the subsurface
+					// to that rectangle's screen position.
+					clippedBitmap = CreateClippedCommitBitmap (commitBitmap, sourceLogical, window.BufferScale);
+					commitBitmap = clippedBitmap;
+				}
+
+				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (liveConnection, shmId, commitBitmap, window.BufferScale);
 				window.Buffers.Add (buffer);
 				waylandBuffers [buffer.BufferId] = buffer;
 
 				// wl_surface.damage_buffer is in physical buffer pixels.  The
 				// buffer scale tells the compositor how those pixels map back to
 				// the surface's logical size.
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
 					b.WriteInt32 (buffer.Scale);
 				});
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
 					b.WriteObject (buffer.BufferId);
 					b.WriteInt32 (0);
 					b.WriteInt32 (0);
 				});
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.DamageBuffer, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.DamageBuffer, delegate (WaylandRequestBuilder b) {
 					b.WriteInt32 (0);
 					b.WriteInt32 (0);
 					b.WriteInt32 (buffer.BufferWidth);
 					b.WriteInt32 (buffer.BufferHeight);
 				});
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+				window.BufferAttached = true;
 			} finally {
+				if (clippedBitmap != null)
+					clippedBitmap.Dispose ();
 				if (caretBitmap != null)
 					caretBitmap.Dispose ();
 			}
@@ -1708,11 +1740,12 @@ namespace System.Windows.Forms {
 
 		void ApplyCursor (WaylandWindow window)
 		{
-			if (connection == null || pointerId == 0 || pointerEnterSerial == 0)
+			if (pointerId == 0 || pointerEnterSerial == 0)
 				return;
+			WaylandConnection liveConnection = RequireConnection ();
 
 			if (!cursorVisible) {
-				connection.SendRequest (pointerId, WaylandProtocol.WlPointer.SetCursor, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (pointerId, WaylandProtocol.WlPointer.SetCursor, delegate (WaylandRequestBuilder b) {
 					b.WriteUInt32 (pointerEnterSerial);
 					b.WriteObject (0);
 					b.WriteInt32 (0);
@@ -1729,14 +1762,14 @@ namespace System.Windows.Forms {
 			uint shape;
 			if (TryGetCursorShape (cursor, out shape)) {
 				EnsureCursorShapeDevice ();
-				if (cursorShapeDeviceId != 0) {
+					if (cursorShapeDeviceId != 0) {
 					// cursor-shape-v1 lets standard WinForms cursors use the
 					// compositor/theme's cursor artwork.  Keep the SHM cursor
 					// path below for custom cursors and older compositors.
-					connection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.SetShape, delegate (WaylandRequestBuilder b) {
-						b.WriteUInt32 (pointerEnterSerial);
-						b.WriteUInt32 (shape);
-					});
+						liveConnection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.SetShape, delegate (WaylandRequestBuilder b) {
+							b.WriteUInt32 (pointerEnterSerial);
+							b.WriteUInt32 (shape);
+						});
 					return;
 				}
 			}
@@ -1748,7 +1781,7 @@ namespace System.Windows.Forms {
 			// Wayland cursors are not window properties.  The compositor asks
 			// for a cursor surface per pointer-enter serial, so every enter and
 			// every managed SetCursor needs to update wl_pointer.set_cursor.
-			connection.SendRequest (pointerId, WaylandProtocol.WlPointer.SetCursor, delegate (WaylandRequestBuilder b) {
+			liveConnection.SendRequest (pointerId, WaylandProtocol.WlPointer.SetCursor, delegate (WaylandRequestBuilder b) {
 				b.WriteUInt32 (pointerEnterSerial);
 				b.WriteObject (cursorSurfaceId);
 				b.WriteInt32 (cursor.HotspotX);
@@ -1761,8 +1794,9 @@ namespace System.Windows.Forms {
 			if (cursorSurfaceId != 0)
 				return;
 
-			cursorSurfaceId = connection.AllocateId ();
-			connection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
+			WaylandConnection liveConnection = RequireConnection ();
+			cursorSurfaceId = liveConnection.AllocateId ();
+			liveConnection.SendRequest (compositorId, WaylandProtocol.WlCompositor.CreateSurface, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (cursorSurfaceId);
 			});
 			cursorSurfaceCommitted = false;
@@ -1773,8 +1807,9 @@ namespace System.Windows.Forms {
 			if (cursorShapeManagerId == 0 || pointerId == 0 || cursorShapeDeviceId != 0)
 				return;
 
-			cursorShapeDeviceId = connection.AllocateId ();
-			connection.SendRequest (cursorShapeManagerId, WaylandProtocol.WpCursorShapeManagerV1.GetPointer, delegate (WaylandRequestBuilder b) {
+			WaylandConnection liveConnection = RequireConnection ();
+			cursorShapeDeviceId = liveConnection.AllocateId ();
+			liveConnection.SendRequest (cursorShapeManagerId, WaylandProtocol.WpCursorShapeManagerV1.GetPointer, delegate (WaylandRequestBuilder b) {
 				b.WriteNewId (cursorShapeDeviceId);
 				b.WriteObject (pointerId);
 			});
@@ -1869,25 +1904,26 @@ namespace System.Windows.Forms {
 			if (cursorSurfaceCommitted && renderedCursor == cursor.Handle && renderedCursorScale == scale)
 				return;
 
+			WaylandConnection liveConnection = RequireConnection ();
 			using (Bitmap bitmap = RenderCursorBitmap (cursor, scale)) {
-				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (connection, shmId, bitmap, scale);
+				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (liveConnection, shmId, bitmap, scale);
 				waylandBuffers [buffer.BufferId] = buffer;
 
-				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
 					b.WriteInt32 (scale);
 				});
-				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
 					b.WriteObject (buffer.BufferId);
 					b.WriteInt32 (0);
 					b.WriteInt32 (0);
 				});
-				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.DamageBuffer, delegate (WaylandRequestBuilder b) {
+				liveConnection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.DamageBuffer, delegate (WaylandRequestBuilder b) {
 					b.WriteInt32 (0);
 					b.WriteInt32 (0);
 					b.WriteInt32 (buffer.BufferWidth);
 					b.WriteInt32 (buffer.BufferHeight);
 				});
-				connection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Commit, null);
+				liveConnection.SendRequest (cursorSurfaceId, WaylandProtocol.WlSurface.Commit, null);
 			}
 
 			renderedCursor = cursor.Handle;
@@ -2251,25 +2287,38 @@ namespace System.Windows.Forms {
 
 		void DestroyNativeWindow (WaylandWindow window)
 		{
-			if (connection == null)
-				return;
+			WaylandConnection liveConnection = connection;
+
+			// Destroying or recreating a parent wl_surface invalidates all server
+			// side wl_subsurface relationships below it.  Keep that invariant here
+			// so callers such as SetOwner/SetParent cannot leave child HWNDs with
+			// stale subsurface ids that later make place_above/set_position invalid.
+			DestroyChildNativeWindows (window);
 
 			foreach (WaylandShmBuffer buffer in window.Buffers) {
 				waylandBuffers.Remove (buffer.BufferId);
-				buffer.DestroyWaylandObject (connection);
+				// This is teardown, not a live rendering path.  If the display
+				// connection already failed, there is no valid server object left
+				// to destroy; still release the local bitmap/fd state below.
+				if (liveConnection != null)
+					buffer.DestroyWaylandObject (liveConnection);
+				else
+					buffer.Dispose ();
 			}
 			window.Buffers.Clear ();
 
-			if (window.XdgPopupId != 0)
-				connection.SendRequest (window.XdgPopupId, WaylandProtocol.XdgPopup.Destroy, null);
-			if (window.XdgToplevelId != 0)
-				connection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.Destroy, null);
-			if (window.XdgSurfaceId != 0)
-				connection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.Destroy, null);
-			if (window.SubsurfaceId != 0)
-				connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.Destroy, null);
-			if (window.SurfaceId != 0)
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Destroy, null);
+			if (liveConnection != null) {
+				if (window.XdgPopupId != 0)
+					liveConnection.SendRequest (window.XdgPopupId, WaylandProtocol.XdgPopup.Destroy, null);
+				if (window.XdgToplevelId != 0)
+					liveConnection.SendRequest (window.XdgToplevelId, WaylandProtocol.XdgToplevel.Destroy, null);
+				if (window.XdgSurfaceId != 0)
+					liveConnection.SendRequest (window.XdgSurfaceId, WaylandProtocol.XdgSurface.Destroy, null);
+				if (window.SubsurfaceId != 0)
+					liveConnection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.Destroy, null);
+				if (window.SurfaceId != 0)
+					liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Destroy, null);
+			}
 
 			waylandObjects.Remove (window.SurfaceId);
 			waylandObjects.Remove (window.SubsurfaceId);
@@ -2282,19 +2331,27 @@ namespace System.Windows.Forms {
 			window.XdgToplevelId = 0;
 			window.XdgPopupId = 0;
 			window.XdgConfigured = false;
+			window.BufferAttached = false;
 		}
 
 		void UnmapNativeWindow (WaylandWindow window)
 		{
-			if (connection == null || window.SurfaceId == 0)
+			DetachSurfaceBuffer (window);
+		}
+
+		void DetachSurfaceBuffer (WaylandWindow window)
+		{
+			if (window.SurfaceId == 0 || !window.BufferAttached)
 				return;
 
-			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
+			WaylandConnection liveConnection = RequireConnection ();
+			liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Attach, delegate (WaylandRequestBuilder b) {
 				b.WriteObject (0);
 				b.WriteInt32 (0);
 				b.WriteInt32 (0);
 			});
-			connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+			liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.Commit, null);
+			window.BufferAttached = false;
 		}
 
 		void DestroyChildNativeWindows (WaylandWindow parent)
@@ -2305,27 +2362,42 @@ namespace System.Windows.Forms {
 					children.Add (candidate);
 			}
 
-			foreach (WaylandWindow child in children) {
-				DestroyChildNativeWindows (child);
+			foreach (WaylandWindow child in children)
 				DestroyNativeWindow (child);
+		}
+
+		void InvalidateWindowTree (WaylandWindow window)
+		{
+			Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
+
+			List<WaylandWindow> children = new List<WaylandWindow> ();
+			foreach (WaylandWindow candidate in windows.Values) {
+				if (candidate.Hwnd.Parent == window.Hwnd)
+					children.Add (candidate);
 			}
+
+			foreach (WaylandWindow child in children)
+				InvalidateWindowTree (child);
 		}
 
 		void DispatchWaylandPending (int timeoutMilliseconds)
 		{
-			if (connection == null)
-				return;
+			WaylandConnection liveConnection = RequireConnection ();
 
 			try {
 				WaylandMessage message;
-				while (connection.TryReadMessage (timeoutMilliseconds, out message)) {
+				while (liveConnection.TryReadMessage (timeoutMilliseconds, out message)) {
 					HandleWaylandMessage (message);
 					timeoutMilliseconds = 0;
 				}
-			} catch (Exception e) {
-				Console.Error.WriteLine ("Wayland dispatch failed: {0}", e.Message);
+				} catch (Exception e) {
+					Console.Error.WriteLine ("Wayland dispatch failed: {0}", e.Message);
+					if (connection == liveConnection)
+						connection = null;
+					liveConnection.Dispose ();
+					throw;
+				}
 			}
-		}
 
 		void HandleWaylandMessage (WaylandMessage message)
 		{
@@ -2343,7 +2415,8 @@ namespace System.Windows.Forms {
 			if (message.ObjectId == xdgWmBaseId && message.Opcode == WaylandProtocol.XdgWmBase.Ping) {
 				WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
 				uint serial = reader.ReadUInt32 ();
-				connection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.Pong, delegate (WaylandRequestBuilder b) {
+				WaylandConnection liveConnection = RequireConnection ();
+				liveConnection.SendRequest (xdgWmBaseId, WaylandProtocol.XdgWmBase.Pong, delegate (WaylandRequestBuilder b) {
 					b.WriteUInt32 (serial);
 				});
 				return;
@@ -2425,23 +2498,24 @@ namespace System.Windows.Forms {
 			if (message.Opcode != WaylandProtocol.WlSeat.Capabilities)
 				return;
 
+			WaylandConnection liveConnection = RequireConnection ();
 			WaylandMessageReader reader = new WaylandMessageReader (message.Payload);
 			uint capabilities = reader.ReadUInt32 ();
 
 			if ((capabilities & WaylandProtocol.WlSeat.CapabilityPointer) != 0) {
 				if (pointerId == 0) {
-					pointerId = connection.AllocateId ();
-					connection.SendRequest (seatId, WaylandProtocol.WlSeat.GetPointer, delegate (WaylandRequestBuilder b) {
+					pointerId = liveConnection.AllocateId ();
+					liveConnection.SendRequest (seatId, WaylandProtocol.WlSeat.GetPointer, delegate (WaylandRequestBuilder b) {
 						b.WriteNewId (pointerId);
 					});
 					EnsureCursorShapeDevice ();
 				}
 			} else if (pointerId != 0) {
 				if (cursorShapeDeviceId != 0) {
-					connection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.Destroy, null);
+					liveConnection.SendRequest (cursorShapeDeviceId, WaylandProtocol.WpCursorShapeDeviceV1.Destroy, null);
 					cursorShapeDeviceId = 0;
 				}
-				connection.SendRequest (pointerId, WaylandProtocol.WlPointer.Release, null);
+				liveConnection.SendRequest (pointerId, WaylandProtocol.WlPointer.Release, null);
 				pointerId = 0;
 				pointerWindow = null;
 				mouseButtons = MouseButtons.None;
@@ -2450,13 +2524,13 @@ namespace System.Windows.Forms {
 
 			if ((capabilities & WaylandProtocol.WlSeat.CapabilityKeyboard) != 0) {
 				if (keyboardId == 0) {
-					keyboardId = connection.AllocateId ();
-					connection.SendRequest (seatId, WaylandProtocol.WlSeat.GetKeyboard, delegate (WaylandRequestBuilder b) {
+					keyboardId = liveConnection.AllocateId ();
+					liveConnection.SendRequest (seatId, WaylandProtocol.WlSeat.GetKeyboard, delegate (WaylandRequestBuilder b) {
 						b.WriteNewId (keyboardId);
 					});
 				}
 			} else if (keyboardId != 0) {
-				connection.SendRequest (keyboardId, WaylandProtocol.WlKeyboard.Release, null);
+				liveConnection.SendRequest (keyboardId, WaylandProtocol.WlKeyboard.Release, null);
 				keyboardId = 0;
 				keyboardWindow = null;
 				evdevKeysDown.Clear ();
@@ -2754,7 +2828,8 @@ namespace System.Windows.Forms {
 
 			window.BufferScale = scale;
 			if (window.SurfaceId != 0) {
-				connection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
+				WaylandConnection liveConnection = RequireConnection ();
+				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
 					b.WriteInt32 (window.BufferScale);
 				});
 				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
@@ -3299,7 +3374,8 @@ namespace System.Windows.Forms {
 				}
 			}
 
-			connection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.PlaceAbove, delegate (WaylandRequestBuilder b) {
+			WaylandConnection liveConnection = RequireConnection ();
+			liveConnection.SendRequest (window.SubsurfaceId, WaylandProtocol.WlSubsurface.PlaceAbove, delegate (WaylandRequestBuilder b) {
 				b.WriteObject (targetSurface);
 			});
 		}
