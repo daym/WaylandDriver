@@ -144,6 +144,11 @@ namespace System.Windows.Forms {
 			get { return themesEnabled; }
 		}
 
+		internal override bool DropTarget {
+			get { return false; }
+			set { }
+		}
+
 		internal override int KeyboardSpeed {
 			get { return 31; }
 		}
@@ -564,6 +569,18 @@ namespace System.Windows.Forms {
 
 		internal override void SetModal (IntPtr handle, bool modal)
 		{
+		}
+
+		internal override void SetAllowDrop (IntPtr handle, bool value)
+		{
+			WaylandWindow window;
+			if (windows.TryGetValue (handle, out window))
+				window.Hwnd.allow_drop = value;
+		}
+
+		internal override DragDropEffects StartDrag (IntPtr handle, object data, DragDropEffects allowedEffects)
+		{
+			return DragDropEffects.None;
 		}
 
 		internal override void Invalidate (IntPtr handle, Rectangle rc, bool clear)
