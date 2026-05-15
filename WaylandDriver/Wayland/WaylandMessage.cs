@@ -7,12 +7,19 @@ namespace WaylandDriver.Wayland {
 		public readonly uint ObjectId;
 		public readonly ushort Opcode;
 		public readonly byte [] Payload;
+		public readonly int [] Fds;
 
 		public WaylandMessage (uint objectId, ushort opcode, byte [] payload)
+			: this (objectId, opcode, payload, null)
+		{
+		}
+
+		public WaylandMessage (uint objectId, ushort opcode, byte [] payload, int [] fds)
 		{
 			ObjectId = objectId;
 			Opcode = opcode;
 			Payload = payload ?? new byte [0];
+			Fds = fds ?? new int [0];
 		}
 	}
 

@@ -116,6 +116,8 @@ namespace WaylandDriver.Wayland {
 			public const ushort Modifiers = 4;
 			public const ushort RepeatInfo = 5;
 
+			public const uint KeymapFormatNoKeymap = 0;
+			public const uint KeymapFormatXkbV1 = 1;
 			public const uint KeyStateReleased = 0;
 			public const uint KeyStatePressed = 1;
 		}

@@ -5,7 +5,10 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
+using Mono.Unix;
+using Mono.Unix.Native;
 using WaylandDriver.Wayland;
 
 namespace System.Windows.Forms {
@@ -120,6 +123,304 @@ namespace System.Windows.Forms {
 			}
 		}
 
+		sealed class WaylandKeymap {
+			public readonly uint Format;
+			public readonly byte [] Bytes;
+			public readonly string Text;
+
+			WaylandKeymap (uint format, byte [] bytes, string text)
+			{
+				Format = format;
+				Bytes = bytes;
+				Text = text ?? String.Empty;
+			}
+
+			public static unsafe WaylandKeymap ReadFromFd (uint format, int fd, uint size)
+			{
+				byte [] bytes = new byte [checked ((int) size)];
+				try {
+					int offset = 0;
+					fixed (byte* data = bytes) {
+						while (offset < bytes.Length) {
+							long n = Syscall.read (fd, (IntPtr) (data + offset), (ulong) (bytes.Length - offset));
+							if (n < 0)
+								UnixMarshal.ThrowExceptionForLastError ();
+							if (n == 0)
+								break;
+							offset += (int) n;
+						}
+					}
+
+					if (offset != bytes.Length)
+						Array.Resize (ref bytes, offset);
+
+					int textLength = bytes.Length;
+					if (textLength > 0 && bytes [textLength - 1] == 0)
+						textLength--;
+					string text = format == WaylandProtocol.WlKeyboard.KeymapFormatXkbV1 ?
+						Encoding.UTF8.GetString (bytes, 0, textLength) : String.Empty;
+					return new WaylandKeymap (format, bytes, text);
+				} finally {
+					Syscall.close (fd);
+				}
+			}
+		}
+
+		struct WaylandKeyResult {
+			public Keys KeyCode;
+			public string Text;
+		}
+
+		interface IWaylandKeyboardLayout : IDisposable {
+			Keys ModifierKeys { get; }
+			void SetModifiers (uint depressed, uint latched, uint locked, uint group);
+			WaylandKeyResult TranslateKey (uint evdevKey, bool pressed);
+		}
+
+		sealed class PhysicalUsKeyboardLayout : IWaylandKeyboardLayout {
+			readonly HashSet<uint> keysDown = new HashSet<uint> ();
+			Keys modifierKeys;
+
+			public Keys ModifierKeys {
+				get { return modifierKeys; }
+			}
+
+			public void SetModifiers (uint depressed, uint latched, uint locked, uint group)
+			{
+				// Without an XKB keymap, the masks are not meaningful.  Keep
+				// modifier state from physical key events instead.
+			}
+
+			public WaylandKeyResult TranslateKey (uint evdevKey, bool pressed)
+			{
+				if (pressed)
+					keysDown.Add (evdevKey);
+				else
+					keysDown.Remove (evdevKey);
+				UpdateModifierKeys ();
+
+				Keys key = MapEvdevKey (evdevKey);
+				WaylandKeyResult result = new WaylandKeyResult ();
+				result.KeyCode = key;
+				char ch;
+				if (pressed && TryGetKeyChar (key, modifierKeys, false, out ch))
+					result.Text = new string (ch, 1);
+				return result;
+			}
+
+			public void Dispose ()
+			{
+			}
+
+			void UpdateModifierKeys ()
+			{
+				Keys keys = Keys.None;
+				if (keysDown.Contains (42) || keysDown.Contains (54))
+					keys |= Keys.Shift;
+				if (keysDown.Contains (29) || keysDown.Contains (97))
+					keys |= Keys.Control;
+				if (keysDown.Contains (56) || keysDown.Contains (100))
+					keys |= Keys.Alt;
+				modifierKeys = keys;
+			}
+		}
+
+		sealed class ManagedXkbKeyboardLayout : IWaylandKeyboardLayout {
+			public static IWaylandKeyboardLayout TryCreate (WaylandKeymap keymap, out string diagnostic)
+			{
+				diagnostic = "managed XKB parser is not implemented";
+				return null;
+			}
+
+			public Keys ModifierKeys {
+				get { return Keys.None; }
+			}
+
+			public void SetModifiers (uint depressed, uint latched, uint locked, uint group)
+			{
+			}
+
+			public WaylandKeyResult TranslateKey (uint evdevKey, bool pressed)
+			{
+				return new WaylandKeyResult ();
+			}
+
+			public void Dispose ()
+			{
+			}
+		}
+
+		sealed class LibXkbCommonKeyboardLayout : IWaylandKeyboardLayout {
+			const int XkbContextNoFlags = 0;
+			const int XkbKeymapFormatTextV1 = 1;
+			const int XkbKeymapCompileNoFlags = 0;
+			const string ModNameShift = "Shift";
+			const string ModNameControl = "Control";
+			const string ModNameAlt = "Mod1";
+
+			IntPtr context;
+			IntPtr keymap;
+			IntPtr state;
+			uint shiftIndex = UInt32.MaxValue;
+			uint controlIndex = UInt32.MaxValue;
+			uint altIndex = UInt32.MaxValue;
+			Keys modifierKeys;
+
+			LibXkbCommonKeyboardLayout (IntPtr context, IntPtr keymap, IntPtr state)
+			{
+				this.context = context;
+				this.keymap = keymap;
+				this.state = state;
+				shiftIndex = xkb_keymap_mod_get_index (keymap, ModNameShift);
+				controlIndex = xkb_keymap_mod_get_index (keymap, ModNameControl);
+				altIndex = xkb_keymap_mod_get_index (keymap, ModNameAlt);
+			}
+
+			public static IWaylandKeyboardLayout TryCreate (WaylandKeymap waylandKeymap, out string diagnostic)
+			{
+				diagnostic = null;
+				if (waylandKeymap.Format != WaylandProtocol.WlKeyboard.KeymapFormatXkbV1 || String.IsNullOrEmpty (waylandKeymap.Text)) {
+					diagnostic = "unsupported Wayland keymap format";
+					return null;
+				}
+
+				IntPtr context = IntPtr.Zero;
+				IntPtr keymap = IntPtr.Zero;
+				IntPtr state = IntPtr.Zero;
+				try {
+					context = xkb_context_new (XkbContextNoFlags);
+					if (context == IntPtr.Zero) {
+						diagnostic = "xkb_context_new failed";
+						return null;
+					}
+
+					keymap = xkb_keymap_new_from_string (context, waylandKeymap.Text, XkbKeymapFormatTextV1, XkbKeymapCompileNoFlags);
+					if (keymap == IntPtr.Zero) {
+						diagnostic = "xkb_keymap_new_from_string failed";
+						return null;
+					}
+
+					state = xkb_state_new (keymap);
+					if (state == IntPtr.Zero) {
+						diagnostic = "xkb_state_new failed";
+						return null;
+					}
+
+					LibXkbCommonKeyboardLayout layout = new LibXkbCommonKeyboardLayout (context, keymap, state);
+					context = keymap = state = IntPtr.Zero;
+					return layout;
+				} catch (DllNotFoundException e) {
+					diagnostic = e.Message;
+					return null;
+				} catch (EntryPointNotFoundException e) {
+					diagnostic = e.Message;
+					return null;
+				} finally {
+					if (state != IntPtr.Zero)
+						xkb_state_unref (state);
+					if (keymap != IntPtr.Zero)
+						xkb_keymap_unref (keymap);
+					if (context != IntPtr.Zero)
+						xkb_context_unref (context);
+				}
+			}
+
+			public Keys ModifierKeys {
+				get { return modifierKeys; }
+			}
+
+			public void SetModifiers (uint depressed, uint latched, uint locked, uint group)
+			{
+				xkb_state_update_mask (state, depressed, latched, locked, 0, 0, group);
+				Keys keys = Keys.None;
+				uint active = depressed | latched | locked;
+				if (IsMaskActive (active, shiftIndex))
+					keys |= Keys.Shift;
+				if (IsMaskActive (active, controlIndex))
+					keys |= Keys.Control;
+				if (IsMaskActive (active, altIndex))
+					keys |= Keys.Alt;
+				modifierKeys = keys;
+			}
+
+			public WaylandKeyResult TranslateKey (uint evdevKey, bool pressed)
+			{
+				uint xkbKeycode = evdevKey + 8;
+				WaylandKeyResult result = new WaylandKeyResult ();
+				uint keysym = xkb_state_key_get_one_sym (state, xkbKeycode);
+				result.KeyCode = MapKeysymToKeys (keysym);
+				if (result.KeyCode == Keys.None)
+					result.KeyCode = MapEvdevKey (evdevKey);
+				if (pressed && (modifierKeys & Keys.Control) == 0)
+					result.Text = GetUtf8 (state, xkbKeycode);
+				return result;
+			}
+
+			public void Dispose ()
+			{
+				if (state != IntPtr.Zero) {
+					xkb_state_unref (state);
+					state = IntPtr.Zero;
+				}
+				if (keymap != IntPtr.Zero) {
+					xkb_keymap_unref (keymap);
+					keymap = IntPtr.Zero;
+				}
+				if (context != IntPtr.Zero) {
+					xkb_context_unref (context);
+					context = IntPtr.Zero;
+				}
+			}
+
+			static bool IsMaskActive (uint mask, uint index)
+			{
+				return index != UInt32.MaxValue && index < 32 && (mask & (1u << (int) index)) != 0;
+			}
+
+			static string GetUtf8 (IntPtr state, uint xkbKeycode)
+			{
+				byte [] bytes = new byte [8];
+				int actual = xkb_state_key_get_utf8 (state, xkbKeycode, bytes, (UIntPtr) bytes.Length);
+				if (actual >= bytes.Length) {
+					bytes = new byte [actual + 1];
+					actual = xkb_state_key_get_utf8 (state, xkbKeycode, bytes, (UIntPtr) bytes.Length);
+				}
+				if (actual <= 0)
+					return null;
+				return Encoding.UTF8.GetString (bytes, 0, actual);
+			}
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern IntPtr xkb_context_new (int flags);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern void xkb_context_unref (IntPtr context);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern IntPtr xkb_keymap_new_from_string (IntPtr context, string map, int format, int flags);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern void xkb_keymap_unref (IntPtr keymap);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern uint xkb_keymap_mod_get_index (IntPtr keymap, string name);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern IntPtr xkb_state_new (IntPtr keymap);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern void xkb_state_unref (IntPtr state);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern int xkb_state_update_mask (IntPtr state, uint depressedMods, uint latchedMods, uint lockedMods, uint depressedLayout, uint latchedLayout, uint lockedLayout);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern uint xkb_state_key_get_one_sym (IntPtr state, uint keycode);
+
+			[DllImport ("libxkbcommon.so.0")]
+			static extern int xkb_state_key_get_utf8 (IntPtr state, uint keycode, byte [] buffer, UIntPtr size);
+		}
+
 		readonly object queueLock = new object ();
 		readonly Queue messageQueue = new Queue ();
 		readonly Dictionary<IntPtr, WaylandWindow> windows = new Dictionary<IntPtr, WaylandWindow> ();
@@ -131,8 +432,9 @@ namespace System.Windows.Forms {
 		readonly List<Timer> timers = new List<Timer> ();
 		readonly Bitmap fallbackBitmap = new Bitmap (1, 1, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
 		readonly HashSet<uint> evdevKeysDown = new HashSet<uint> ();
-		readonly Dictionary<string, char> keyText = new Dictionary<string, char> ();
+		readonly Dictionary<string, string> keyText = new Dictionary<string, string> ();
 		readonly WaylandCaret caret = new WaylandCaret ();
+		IWaylandKeyboardLayout keyboardLayout = new PhysicalUsKeyboardLayout ();
 
 		WaylandConnection connection;
 		WaylandRegistry registry;
@@ -161,6 +463,10 @@ namespace System.Windows.Forms {
 		Point mousePosition;
 		MouseButtons mouseButtons;
 		Keys modifierKeys;
+		uint keyboardModsDepressed;
+		uint keyboardModsLatched;
+		uint keyboardModsLocked;
+		uint keyboardGroup;
 		bool cursorVisible = true;
 		bool cursorSurfaceCommitted;
 		int renderedCursorScale;
@@ -334,6 +640,13 @@ namespace System.Windows.Forms {
 			cursors.Clear ();
 			evdevKeysDown.Clear ();
 			keyText.Clear ();
+			keyboardLayout.Dispose ();
+			keyboardLayout = new PhysicalUsKeyboardLayout ();
+			modifierKeys = Keys.None;
+			keyboardModsDepressed = 0;
+			keyboardModsLatched = 0;
+			keyboardModsLocked = 0;
+			keyboardGroup = 0;
 			cursorSurfaceId = 0;
 			cursorShapeDeviceId = 0;
 			cursorShapeManagerId = 0;
@@ -930,9 +1243,9 @@ namespace System.Windows.Forms {
 
 		internal override bool TranslateMessage (ref MSG msg)
 		{
-			char ch;
+			string text;
 			string key = GetKeyTextKey (msg);
-			if (!keyText.TryGetValue (key, out ch))
+			if (!keyText.TryGetValue (key, out text))
 				return true;
 
 			keyText.Remove (key);
@@ -941,7 +1254,8 @@ namespace System.Windows.Forms {
 			// WM_CHAR here, not directly from wl_keyboard.key, so shortcut and
 			// dialog-key filtering sees the same message order as the other
 			// native drivers.
-			PostInputMessage (msg.hwnd, msg.message == Msg.WM_SYSKEYDOWN ? Msg.WM_SYSCHAR : Msg.WM_CHAR, (IntPtr) ch, msg.lParam, msg.time);
+			for (int i = 0; i < text.Length; i++)
+				PostInputMessage (msg.hwnd, msg.message == Msg.WM_SYSKEYDOWN ? Msg.WM_SYSCHAR : Msg.WM_CHAR, (IntPtr) text [i], msg.lParam, msg.time);
 			return true;
 		}
 
@@ -2593,7 +2907,7 @@ namespace System.Windows.Forms {
 				keyboardId = 0;
 				keyboardWindow = null;
 				evdevKeysDown.Clear ();
-				modifierKeys = Keys.None;
+				ResetKeyboardLayout ();
 			}
 		}
 
@@ -2755,11 +3069,7 @@ namespace System.Windows.Forms {
 
 			switch (message.Opcode) {
 			case WaylandProtocol.WlKeyboard.Keymap:
-				// This intentionally ignores the compositor keymap for now.
-				// wl_keyboard sends XKB keymaps through file descriptors, and a
-				// correct managed implementation needs an XKB parser instead of
-				// libxkbcommon.  Until that exists, key routing is physical
-				// evdev-to-Keys plus US ASCII text for TranslateMessage.
+				HandleKeyboardKeymap (reader, message);
 				return;
 
 			case WaylandProtocol.WlKeyboard.Enter: {
@@ -2791,11 +3101,71 @@ namespace System.Windows.Forms {
 
 			case WaylandProtocol.WlKeyboard.Modifiers:
 				lastInputSerial = reader.ReadUInt32 ();
-				// The depressed/latched/locked masks are XKB-keymap dependent.
-				// With no managed XKB layer yet, keep modifier state from the
-				// physical key events we route below instead of guessing mask bits.
+				keyboardModsDepressed = reader.ReadUInt32 ();
+				keyboardModsLatched = reader.ReadUInt32 ();
+				keyboardModsLocked = reader.ReadUInt32 ();
+				keyboardGroup = reader.ReadUInt32 ();
+				keyboardLayout.SetModifiers (keyboardModsDepressed, keyboardModsLatched, keyboardModsLocked, keyboardGroup);
+				modifierKeys = keyboardLayout.ModifierKeys;
 				return;
 			}
+		}
+
+		void HandleKeyboardKeymap (WaylandMessageReader reader, WaylandMessage message)
+		{
+			uint format = reader.ReadUInt32 ();
+			uint size = reader.ReadUInt32 ();
+
+			if (format == WaylandProtocol.WlKeyboard.KeymapFormatNoKeymap) {
+				ResetKeyboardLayout ();
+				return;
+			}
+
+			if (message.Fds.Length == 0) {
+				ResetKeyboardLayout ();
+				return;
+			}
+
+			WaylandKeymap keymap;
+			try {
+				keymap = WaylandKeymap.ReadFromFd (format, message.Fds [0], size);
+			} catch {
+				ResetKeyboardLayout ();
+				return;
+			} finally {
+				for (int i = 1; i < message.Fds.Length; i++)
+					Syscall.close (message.Fds [i]);
+			}
+
+			InstallKeyboardLayout (keymap);
+		}
+
+		void InstallKeyboardLayout (WaylandKeymap keymap)
+		{
+			string diagnostic;
+			IWaylandKeyboardLayout layout = ManagedXkbKeyboardLayout.TryCreate (keymap, out diagnostic);
+			if (layout == null)
+				layout = LibXkbCommonKeyboardLayout.TryCreate (keymap, out diagnostic);
+			if (layout == null)
+				layout = new PhysicalUsKeyboardLayout ();
+
+			keyboardLayout.Dispose ();
+			keyboardLayout = layout;
+			keyboardLayout.SetModifiers (keyboardModsDepressed, keyboardModsLatched, keyboardModsLocked, keyboardGroup);
+			modifierKeys = keyboardLayout.ModifierKeys;
+			keyText.Clear ();
+		}
+
+		void ResetKeyboardLayout ()
+		{
+			keyboardLayout.Dispose ();
+			keyboardLayout = new PhysicalUsKeyboardLayout ();
+			modifierKeys = Keys.None;
+			keyboardModsDepressed = 0;
+			keyboardModsLatched = 0;
+			keyboardModsLocked = 0;
+			keyboardGroup = 0;
+			keyText.Clear ();
 		}
 
 		void HandleKeyboardKey (WaylandMessageReader reader)
@@ -2812,9 +3182,10 @@ namespace System.Windows.Forms {
 				evdevKeysDown.Add (evdevKey);
 			else
 				evdevKeysDown.Remove (evdevKey);
-			UpdateModifierKeys ();
 
-			Keys key = MapEvdevKey (evdevKey);
+			WaylandKeyResult result = keyboardLayout.TranslateKey (evdevKey, pressed);
+			modifierKeys = keyboardLayout.ModifierKeys;
+			Keys key = result.KeyCode;
 			if (key == Keys.None)
 				return;
 
@@ -2836,9 +3207,8 @@ namespace System.Windows.Forms {
 			IntPtr lParam = MakeKeyLParam (evdevKey, pressed, wasDown, sysKey);
 
 			MSG msg = CreateInputMessage (target, message, (IntPtr) key, lParam, time);
-			char ch;
-			if (pressed && TryGetKeyChar (key, modifierKeys, sysKey, out ch))
-				keyText [GetKeyTextKey (msg)] = ch;
+			if (pressed && !String.IsNullOrEmpty (result.Text))
+				keyText [GetKeyTextKey (msg)] = result.Text;
 			EnqueueMessage (msg);
 		}
 
@@ -3381,16 +3751,76 @@ namespace System.Windows.Forms {
 				msg.time.ToString ("x");
 		}
 
-		void UpdateModifierKeys ()
+		static Keys MapKeysymToKeys (uint keysym)
 		{
-			Keys keys = Keys.None;
-			if (evdevKeysDown.Contains (42) || evdevKeysDown.Contains (54))
-				keys |= Keys.Shift;
-			if (evdevKeysDown.Contains (29) || evdevKeysDown.Contains (97))
-				keys |= Keys.Control;
-			if (evdevKeysDown.Contains (56) || evdevKeysDown.Contains (100))
-				keys |= Keys.Alt;
-			modifierKeys = keys;
+			if (keysym >= 'a' && keysym <= 'z')
+				return (Keys) ((int) Keys.A + (int) (keysym - 'a'));
+			if (keysym >= 'A' && keysym <= 'Z')
+				return (Keys) ((int) Keys.A + (int) (keysym - 'A'));
+			if (keysym >= '0' && keysym <= '9')
+				return (Keys) ((int) Keys.D0 + (int) (keysym - '0'));
+			if (keysym >= 0xffbe && keysym <= 0xffc9)
+				return (Keys) ((int) Keys.F1 + (int) (keysym - 0xffbe));
+			if (keysym >= 0xffb0 && keysym <= 0xffb9)
+				return (Keys) ((int) Keys.NumPad0 + (int) (keysym - 0xffb0));
+
+			switch (keysym) {
+			case 0xff1b: return Keys.Escape;
+			case 0xff08: return Keys.Back;
+			case 0xff09: return Keys.Tab;
+			case 0xff0d: return Keys.Return;
+			case 0xffff: return Keys.Delete;
+			case 0xff63: return Keys.Insert;
+			case 0xff50: return Keys.Home;
+			case 0xff57: return Keys.End;
+			case 0xff55: return Keys.PageUp;
+			case 0xff56: return Keys.PageDown;
+			case 0xff51: return Keys.Left;
+			case 0xff52: return Keys.Up;
+			case 0xff53: return Keys.Right;
+			case 0xff54: return Keys.Down;
+			case 0xffe1:
+			case 0xffe2: return Keys.ShiftKey;
+			case 0xffe3:
+			case 0xffe4: return Keys.ControlKey;
+			case 0xffe9:
+			case 0xffea: return Keys.Menu;
+			case 0xffeb: return Keys.LWin;
+			case 0xffec: return Keys.RWin;
+			case 0xffe5: return Keys.CapsLock;
+			case 0xff7f: return Keys.NumLock;
+			case 0xff14: return Keys.Scroll;
+			case 0xff8d: return Keys.Return;
+			case 0xffaa: return Keys.Multiply;
+			case 0xffab: return Keys.Add;
+			case 0xffad: return Keys.Subtract;
+			case 0xffae: return Keys.Decimal;
+			case 0xffaf: return Keys.Divide;
+			case ' ': return Keys.Space;
+			case '-':
+			case '_': return Keys.OemMinus;
+			case '=':
+			case '+': return Keys.Oemplus;
+			case '[':
+			case '{': return Keys.OemOpenBrackets;
+			case ']':
+			case '}': return Keys.OemCloseBrackets;
+			case '\\':
+			case '|': return Keys.OemPipe;
+			case ';':
+			case ':': return Keys.OemSemicolon;
+			case '\'':
+			case '"': return Keys.OemQuotes;
+			case '`':
+			case '~': return Keys.Oemtilde;
+			case ',':
+			case '<': return Keys.Oemcomma;
+			case '.':
+			case '>': return Keys.OemPeriod;
+			case '/':
+			case '?': return Keys.OemQuestion;
+			default: return Keys.None;
+			}
 		}
 
 		static Keys MapEvdevKey (uint key)

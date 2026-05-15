@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
 using Mono.Unix;
@@ -93,7 +94,8 @@ namespace WaylandDriver.Wayland {
 			if (timeoutMilliseconds >= 0 && !socket.Poll (timeoutMilliseconds * 1000, SelectMode.SelectRead))
 				return false;
 
-			byte [] header = ReadExactly (8);
+			List<int> fds = new List<int> ();
+			byte [] header = ReadExactly (8, fds);
 			uint objectId = ReadUInt32 (header, 0);
 			uint second = ReadUInt32 (header, 4);
 			ushort opcode = (ushort) (second & 0xffff);
@@ -102,7 +104,7 @@ namespace WaylandDriver.Wayland {
 			if (size < 8)
 				throw new InvalidDataException ("Invalid Wayland message size.");
 
-			message = new WaylandMessage (objectId, opcode, ReadExactly (size - 8));
+			message = new WaylandMessage (objectId, opcode, ReadExactly (size - 8, fds), fds.ToArray ());
 			return true;
 		}
 
@@ -183,17 +185,65 @@ namespace WaylandDriver.Wayland {
 			return Path.Combine (runtimeDir, display);
 		}
 
-		byte [] ReadExactly (int count)
+		byte [] ReadExactly (int count, List<int> fds)
 		{
 			byte [] buffer = new byte [count];
 			int offset = 0;
 			while (offset < count) {
-				int n = socket.Receive (buffer, offset, count - offset, SocketFlags.None);
+				int n = ReceiveSome (buffer, offset, count - offset, fds);
 				if (n == 0)
 					throw new EndOfStreamException ("Wayland compositor closed the connection.");
 				offset += n;
 			}
 			return buffer;
+		}
+
+		unsafe int ReceiveSome (byte [] buffer, int offset, int count, List<int> fds)
+		{
+			byte [] control = new byte [checked ((int) Syscall.CMSG_SPACE (sizeof (int) * 8))];
+			Msghdr message = new Msghdr {
+				msg_control = control,
+				msg_controllen = control.Length,
+			};
+
+			fixed (byte* bytesPtr = buffer) {
+				message.msg_iov = new [] {
+					new Iovec {
+						iov_base = (IntPtr) (bytesPtr + offset),
+						iov_len = (ulong) count,
+					}
+				};
+				message.msg_iovlen = 1;
+
+				long received = Syscall.recvmsg (socket.Handle.ToInt32 (), message, 0);
+				if (received < 0)
+					UnixMarshal.ThrowExceptionForLastError ();
+
+				ReadReceivedFds (message, fds);
+				return (int) received;
+			}
+		}
+
+		unsafe static void ReadReceivedFds (Msghdr message, List<int> fds)
+		{
+			long offset = Syscall.CMSG_FIRSTHDR (message);
+			while (offset != -1) {
+				Cmsghdr header = Cmsghdr.ReadFromBuffer (message, offset);
+				if (header.cmsg_level == UnixSocketProtocol.SOL_SOCKET &&
+				    header.cmsg_type == UnixSocketControlMessage.SCM_RIGHTS) {
+					long dataOffset = Syscall.CMSG_DATA (message, offset);
+					long headerLength = (long) Syscall.CMSG_LEN (0);
+					int byteCount = checked ((int) (header.cmsg_len - headerLength));
+
+					fixed (byte* controlPtr = message.msg_control) {
+						int* fdPtr = (int*) (controlPtr + dataOffset);
+						for (int i = 0; i < byteCount / sizeof (int); i++)
+							fds.Add (fdPtr [i]);
+					}
+				}
+
+				offset = Syscall.CMSG_NXTHDR (message, offset);
+			}
 		}
 
 		static uint ReadUInt32 (byte [] buffer, int offset)
