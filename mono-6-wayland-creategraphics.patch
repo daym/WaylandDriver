@@ -1,3 +1,15 @@
+Control.CreateGraphics must be driver-routable.  The stock implementation calls
+Graphics.FromHwnd directly, which hard-wires System.Drawing/libgdiplus to the
+native HWND path and bypasses XplatUIDriver.  That breaks loadable backends whose
+native handles are not libgdiplus HWNDs, such as a Wayland backend that paints
+into managed SHM backbuffers.
+
+Add an explicit virtual XplatUIDriver.CreateGraphics hook with the existing
+Graphics.FromHwnd behavior as the default, then route Control.CreateGraphics
+through XplatUI.  Existing backends keep the same behavior unless they override
+the hook; non-HWND backends get a compile-time checked extension point instead
+of reflection or backend-specific special cases in Control.
+
 diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/Control.cs b/mcs/class/System.Windows.Forms/System.Windows.Forms/Control.cs
 index 5b1e913..7bd86de 100644
 --- a/mcs/class/System.Windows.Forms/System.Windows.Forms/Control.cs
@@ -15,22 +27,31 @@ diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs b/mc
 index f254e69..b224ff5 100644
 --- a/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs
 +++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs
-@@ -788,6 +788,17 @@
+@@ -788,6 +788,12 @@
  			driver.InvalidateNC (handle);
  		}
  
 +		internal static Graphics CreateGraphics (IntPtr handle)
 +		{
 +			DriverDebug ("CreateGraphics ({0}): Called", Window (handle));
-+			var createGraphics = driver.GetType ().GetMethod (
-+				"CreateGraphics",
-+				System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic,
-+				null,
-+				new Type [] { typeof (IntPtr) },
-+				null);
-+			return createGraphics == null ? Graphics.FromHwnd (handle) : (Graphics) createGraphics.Invoke (driver, new object [] { handle });
++			return driver.CreateGraphics (handle);
 +		}
- 
++
  		internal static bool IsEnabled (IntPtr handle)
  		{
  			#if DriverDebug || DriverDebugState
+diff --git a/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUIDriver.cs b/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUIDriver.cs
+index 39bd119..16b5d16 100644
+--- a/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUIDriver.cs
++++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUIDriver.cs
+@@ -329,6 +329,10 @@ namespace System.Windows.Forms {
+ 		internal abstract void SetModal(IntPtr handle, bool Modal);
+ 		internal abstract void Invalidate(IntPtr handle, Rectangle rc, bool clear);
+ 		internal abstract void InvalidateNC(IntPtr handle);
++		internal virtual Graphics CreateGraphics (IntPtr handle)
++		{
++			return Graphics.FromHwnd (handle);
++		}
+ 		internal abstract IntPtr DefWndProc(ref Message msg);
+ 		internal abstract void HandleException(Exception e);
+ 		internal abstract void DoEvents();
