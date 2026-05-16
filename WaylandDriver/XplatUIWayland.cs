@@ -413,6 +413,7 @@ namespace System.Windows.Forms {
 		const string MimeHtml = "text/html";
 		const string MimeRtf = "text/rtf";
 		const string ForceClientDecorationsEnvironmentVariable = "MONO_WAYLAND_FORCE_CSD";
+		const int MaxReusableShmBuffersPerWindow = 3;
 		static readonly IntPtr ClipboardHandle = new IntPtr (1);
 		static readonly IntPtr PrimarySelectionHandle = new IntPtr (2);
 
@@ -3211,6 +3212,7 @@ namespace System.Windows.Forms {
 		readonly Dictionary<IntPtr, WaylandWindow> windows = new Dictionary<IntPtr, WaylandWindow> ();
 		readonly Dictionary<uint, WaylandWindow> waylandObjects = new Dictionary<uint, WaylandWindow> ();
 		readonly Dictionary<uint, WaylandShmBuffer> waylandBuffers = new Dictionary<uint, WaylandShmBuffer> ();
+		readonly Dictionary<uint, WaylandWindow> waylandBufferWindows = new Dictionary<uint, WaylandWindow> ();
 		readonly Dictionary<uint, WaylandOutput> waylandOutputs = new Dictionary<uint, WaylandOutput> ();
 		readonly Dictionary<IntPtr, WaylandCursor> cursors = new Dictionary<IntPtr, WaylandCursor> ();
 		readonly Dictionary<uint, WaylandDataOffer> dataOffers = new Dictionary<uint, WaylandDataOffer> ();
@@ -3447,6 +3449,7 @@ namespace System.Windows.Forms {
 			windows.Clear ();
 			waylandObjects.Clear ();
 			waylandBuffers.Clear ();
+			waylandBufferWindows.Clear ();
 			waylandOutputs.Clear ();
 			dataOffers.Clear ();
 			dataSources.Clear ();
@@ -3942,7 +3945,7 @@ namespace System.Windows.Forms {
 			}
 		}
 
-		internal Graphics CreateGraphics (IntPtr handle)
+		internal override Graphics CreateGraphics (IntPtr handle)
 		{
 			WaylandWindow window;
 			if (!windows.TryGetValue (handle, out window))
@@ -5557,9 +5560,7 @@ namespace System.Windows.Forms {
 					commitBitmap = clippedBitmap;
 				}
 
-				WaylandShmBuffer buffer = WaylandShmBuffer.CreateFromBitmap (liveConnection, shmId, commitBitmap, window.BufferScale);
-				window.Buffers.Add (buffer);
-				waylandBuffers [buffer.BufferId] = buffer;
+				WaylandShmBuffer buffer = GetWindowCommitBuffer (window, commitBitmap, liveConnection);
 
 				// wl_surface.damage_buffer is in physical buffer pixels.  The
 				// buffer scale tells the compositor how those pixels map back to
@@ -5586,6 +5587,67 @@ namespace System.Windows.Forms {
 				if (caretBitmap != null)
 					caretBitmap.Dispose ();
 			}
+		}
+
+		WaylandShmBuffer GetWindowCommitBuffer (WaylandWindow window, Bitmap bitmap, WaylandConnection liveConnection)
+		{
+			PruneReleasedWindowBuffers (window, bitmap, window.BufferScale, liveConnection);
+
+			foreach (WaylandShmBuffer buffer in window.Buffers) {
+				if (buffer.Busy || !buffer.MatchesBitmap (bitmap, window.BufferScale))
+					continue;
+
+				buffer.CopyFromBitmap (bitmap);
+				buffer.Busy = true;
+				return buffer;
+			}
+
+			WaylandShmBuffer newBuffer = WaylandShmBuffer.CreateFromBitmap (liveConnection, shmId, bitmap, window.BufferScale);
+			newBuffer.Busy = true;
+			window.Buffers.Add (newBuffer);
+			waylandBuffers [newBuffer.BufferId] = newBuffer;
+			waylandBufferWindows [newBuffer.BufferId] = window;
+			return newBuffer;
+		}
+
+		void PruneReleasedWindowBuffers (WaylandWindow window, Bitmap targetBitmap, int targetScale, WaylandConnection liveConnection)
+		{
+			int retainedMatchingBuffers = 0;
+			int retainedReleasedBuffers = 0;
+
+			for (int i = window.Buffers.Count - 1; i >= 0; i--) {
+				WaylandShmBuffer buffer = window.Buffers [i];
+				if (buffer.Busy)
+					continue;
+
+				if (targetBitmap == null) {
+					if (retainedReleasedBuffers++ < MaxReusableShmBuffersPerWindow)
+						continue;
+
+					DestroyWindowBuffer (window, buffer, liveConnection);
+					continue;
+				}
+
+				bool matchesTarget = buffer.MatchesBitmap (targetBitmap, targetScale);
+				if (matchesTarget && retainedMatchingBuffers++ < MaxReusableShmBuffersPerWindow)
+					continue;
+
+				DestroyWindowBuffer (window, buffer, liveConnection);
+			}
+		}
+
+		void DestroyWindowBuffer (WaylandWindow window, WaylandShmBuffer buffer, WaylandConnection liveConnection)
+		{
+			window.Buffers.Remove (buffer);
+			waylandBuffers.Remove (buffer.BufferId);
+			waylandBufferWindows.Remove (buffer.BufferId);
+			// liveConnection is null only during teardown after the display
+			// connection has failed; there is then no server object left to
+			// destroy, but the local mmap must still be released.
+			if (liveConnection != null)
+				buffer.DestroyWaylandObject (liveConnection);
+			else
+				buffer.Dispose ();
 		}
 
 		void DrawCaretOverlay (WaylandWindow window, Bitmap bitmap)
@@ -6224,16 +6286,8 @@ namespace System.Windows.Forms {
 			// stale subsurface ids that later make place_above/set_position invalid.
 			DestroyChildNativeWindows (window);
 
-			foreach (WaylandShmBuffer buffer in window.Buffers) {
-				waylandBuffers.Remove (buffer.BufferId);
-				// This is teardown, not a live rendering path.  If the display
-				// connection already failed, there is no valid server object left
-				// to destroy; still release the local bitmap/fd state below.
-				if (liveConnection != null)
-					buffer.DestroyWaylandObject (liveConnection);
-				else
-					buffer.Dispose ();
-			}
+			foreach (WaylandShmBuffer buffer in window.Buffers.ToArray ())
+				DestroyWindowBuffer (window, buffer, liveConnection);
 			window.Buffers.Clear ();
 
 			if (liveConnection != null) {
@@ -6400,10 +6454,17 @@ namespace System.Windows.Forms {
 			WaylandShmBuffer releasedBuffer;
 				if (waylandBuffers.TryGetValue (message.ObjectId, out releasedBuffer)) {
 					if (message.Opcode == WaylandProtocol.WlBuffer.Release) {
-						waylandBuffers.Remove (releasedBuffer.BufferId);
-						foreach (WaylandWindow candidate in windows.Values)
-							candidate.Buffers.Remove (releasedBuffer);
-						releasedBuffer.DestroyWaylandObject (RequireConnection ());
+						WaylandWindow owner;
+						if (waylandBufferWindows.TryGetValue (releasedBuffer.BufferId, out owner)) {
+							// Wayland allows the client to write shared memory again
+							// only after wl_buffer.release.  Keep the server object
+							// alive here so the next paint can reuse it.
+							releasedBuffer.Busy = false;
+							PruneReleasedWindowBuffers (owner, null, owner.BufferScale, RequireConnection ());
+						} else {
+							waylandBuffers.Remove (releasedBuffer.BufferId);
+							releasedBuffer.DestroyWaylandObject (RequireConnection ());
+						}
 					}
 					return;
 				}
@@ -6903,10 +6964,12 @@ namespace System.Windows.Forms {
 
 			window.BufferScale = scale;
 			if (window.SurfaceId != 0) {
-				WaylandConnection liveConnection = RequireConnection ();
-				liveConnection.SendRequest (window.SurfaceId, WaylandProtocol.WlSurface.SetBufferScale, delegate (WaylandRequestBuilder b) {
-					b.WriteInt32 (window.BufferScale);
-				});
+				// wl_surface.set_buffer_scale is double-buffered with the
+				// attached wl_buffer.  Changing it before repaint would make a
+				// later commit apply the new scale to the old buffer, which is a
+				// protocol error when the old buffer size is not divisible by the
+				// new scale.  CommitWindowBuffer sends the scale together with
+				// the replacement buffer.
 				if (IsClientDecoratedToplevel (window))
 					InvalidateNC (window.Hwnd.Handle);
 				Invalidate (window.Hwnd.Handle, Rectangle.Empty, false);
@@ -7234,6 +7297,17 @@ namespace System.Windows.Forms {
 					return owner;
 			}
 
+			if (control is ToolTip.ToolTipWindow) {
+				// Mono's ToolTipWindow is a top-level WS_POPUP Control, but it
+				// does not call XplatUI.SetOwner.  The tooltip is still transient
+				// UI for the control currently under the pointer or keyboard
+				// focus, so give Wayland an xdg_popup parent instead of mapping
+				// it as an independent application toplevel.
+				WaylandWindow owner = GetToolTipOwnerWindow (window);
+				if (owner != null)
+					return owner;
+			}
+
 			MonthCalendar calendar = control as MonthCalendar;
 			if (calendar != null && calendar.owner != null && calendar.owner.IsHandleCreated) {
 				// DateTimePicker creates its drop-down MonthCalendar as a
@@ -7245,6 +7319,21 @@ namespace System.Windows.Forms {
 				if (windows.TryGetValue (calendar.owner.Handle, out owner))
 					return owner;
 			}
+
+			return null;
+		}
+
+		WaylandWindow GetToolTipOwnerWindow (WaylandWindow toolTip)
+		{
+			if (pointerWindow != null && pointerWindow != toolTip)
+				return pointerWindow;
+
+			WaylandWindow owner;
+			if (focusWindow != IntPtr.Zero && windows.TryGetValue (focusWindow, out owner) && owner != toolTip)
+				return owner;
+
+			if (activeWindow != IntPtr.Zero && windows.TryGetValue (activeWindow, out owner) && owner != toolTip)
+				return owner;
 
 			return null;
 		}

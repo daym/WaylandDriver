@@ -16,6 +16,7 @@ namespace WaylandDriver.Wayland {
 		public readonly int Scale;
 		public readonly int Stride;
 		public readonly int Size;
+		public bool Busy;
 
 		IntPtr data;
 		bool disposed;
@@ -85,6 +86,17 @@ namespace WaylandDriver.Wayland {
 			}
 		}
 
+		public bool MatchesBitmap (Bitmap bitmap, int scale)
+		{
+			if (scale < 1)
+				scale = 1;
+
+			return BufferWidth == Math.Max (1, bitmap.Width) &&
+				BufferHeight == Math.Max (1, bitmap.Height) &&
+				Stride == checked (BufferWidth * 4) &&
+				Scale == scale;
+		}
+
 		public void DestroyWaylandObject (WaylandConnection connection)
 		{
 			connection.SendRequest (BufferId, WaylandProtocol.WlBuffer.Destroy, null);
@@ -103,8 +115,13 @@ namespace WaylandDriver.Wayland {
 			}
 		}
 
-		unsafe void CopyFromBitmap (Bitmap bitmap)
+		public unsafe void CopyFromBitmap (Bitmap bitmap)
 		{
+			if (disposed)
+				throw new ObjectDisposedException ("WaylandShmBuffer");
+			if (!MatchesBitmap (bitmap, Scale))
+				throw new ArgumentException ("Bitmap dimensions do not match the Wayland shared memory buffer.", "bitmap");
+
 			Rectangle rect = new Rectangle (0, 0, bitmap.Width, bitmap.Height);
 			BitmapData bits = bitmap.LockBits (rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
 			try {
