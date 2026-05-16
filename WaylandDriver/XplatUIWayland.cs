@@ -5680,7 +5680,11 @@ namespace System.Windows.Forms {
 			Rectangle physicalSource = new Rectangle (logicalSource.X * scale, logicalSource.Y * scale,
 				Math.Max (1, logicalSource.Width * scale), Math.Max (1, logicalSource.Height * scale));
 			Bitmap bitmap = new Bitmap (physicalSource.Width, physicalSource.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-			bitmap.SetResolution (source.HorizontalResolution, source.VerticalResolution);
+			// This bitmap is a Wayland buffer-sized crop: dimensions are in
+			// physical pixels, while scale says how they map back to WinForms
+			// logical pixels.  Do not copy DPI metadata from source clones here;
+			// libgdiplus may report values that Bitmap.SetResolution rejects.
+			bitmap.SetResolution (96.0f * scale, 96.0f * scale);
 
 			using (Graphics graphics = Graphics.FromImage (bitmap)) {
 				graphics.CompositingMode = CompositingMode.SourceCopy;
